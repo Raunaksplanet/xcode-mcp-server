@@ -1,0 +1,41 @@
+{
+  "name": "xcode-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Xcode integration - build, test, debug, and control Xcode projects from AI",
+  "type": "module",
+  "bin": {
+    "xcode-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --clean --dts --out-dir dist --target node18",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "zod": "^3.24.3",
+    "fast-xml-parser": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "tsx": "^4.19.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "keywords": [
+    "xcode",
+    "mcp",
+    "modelcontextprotocol",
+    "ios",
+    "swift",
+    "opencode"
+  ]
+}
