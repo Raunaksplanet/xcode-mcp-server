@@ -8,7 +8,7 @@ MCP (Model Context Protocol) server that bridges AI assistants with Xcode, enabl
 
 **macOS / Linux:**
 ```bash
-curl -sL https://raw.githubusercontent.com/.../install.sh | bash
+curl -sL https://raw.githubusercontent.com/Raunaksplanet/xcode-mcp-server/main/install.sh | bash
 # or locally:
 ./install.sh
 ```
@@ -31,7 +31,7 @@ npm start
 
 ## OpenCode Integration
 
-Add to `~/.config/opencode/opencode.json`:
+Clone the repo and add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
