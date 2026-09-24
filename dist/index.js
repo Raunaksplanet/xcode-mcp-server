@@ -3,31 +3,30 @@ import {
   addFileToProject,
   removeFileFromProject,
   setBuildSetting
-} from "./chunk-27WY326M.js";
+} from "./chunk-HXNRHF63.js";
 import {
   getFileEntries,
   getProjectInfo
-} from "./chunk-ODPPORZT.js";
+} from "./chunk-6DVZIY42.js";
+import {
+  readLatestBuildLog
+} from "./chunk-D2VRRTZQ.js";
 import {
   bootSimulator,
-  buildFailed,
-  fileNotFound,
   findSimulator,
   getAvailableSimulators,
   getSimulatorLogs,
   installApp,
   launchApp,
   openURL,
-  pathTraversalDetected,
   pushNotification,
   recordSimulator,
   resetSimulator,
   screenshotSimulator,
   setSimulatorLocation,
   shutdownSimulator,
-  terminateApp,
-  testFailure
-} from "./chunk-5D47YJ7S.js";
+  terminateApp
+} from "./chunk-4STWZO7C.js";
 import {
   archiveBuild,
   getBuildSettings,
@@ -37,11 +36,36 @@ import {
   runBuild,
   xcodebuild,
   xcrun
-} from "./chunk-TB6DDJUC.js";
+} from "./chunk-CLNFH6I5.js";
+import {
+  assertPathInProject,
+  clampDurationSeconds,
+  clampLines,
+  optionalString,
+  parseTimeoutEnv,
+  projectFlag,
+  requireBuildSettingKey,
+  requireBundleId,
+  requireConfigurationName,
+  requireLatitude,
+  requireLongitude,
+  requireNonEmptyString,
+  requirePayloadObject,
+  requireSchemeName,
+  requireTargetName,
+  requireUdidOrName,
+  requireUrl
+} from "./chunk-D6OBCLHW.js";
+import {
+  buildFailed,
+  fileNotFound,
+  invalidInput,
+  testFailure
+} from "./chunk-RRRMKQBB.js";
 import {
   logger,
   setLogLevel
-} from "./chunk-DZSLN5VB.js";
+} from "./chunk-WRFFL27X.js";
 
 // src/server.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -58,12 +82,26 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // src/lib/config.ts
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { readFile, access } from "fs/promises";
 import { resolve as resolvePath, join } from "path";
 function validateProjectPath(rawPath) {
-  const resolved = resolvePath(rawPath);
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    throw new Error("XCODE_PROJECT_PATH is empty.\nSet it to the path of your .xcodeproj or .xcworkspace.");
+  }
+  const resolved = resolvePath(trimmed);
   if (!existsSync(resolved)) {
+    try {
+      const stat2 = readdirSync(resolved);
+      const candidate = stat2.find((f) => f.endsWith(".xcworkspace") || f.endsWith(".xcodeproj"));
+      if (candidate) {
+        const full = join(resolved, candidate);
+        logger.info(`Resolved project directory to ${full}`);
+        return full;
+      }
+    } catch {
+    }
     throw new Error(
       `XCODE_PROJECT_PATH not found at: ${resolved}
 Set the correct path in your environment or .env file.
@@ -84,7 +122,17 @@ async function loadProjectConfig(projectDir) {
   try {
     await access(configPath);
     const content = await readFile(configPath, "utf-8");
-    return JSON.parse(content);
+    try {
+      const parsed = JSON.parse(content);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        logger.warn(`Ignoring ${configPath}: expected a JSON object.`);
+        return {};
+      }
+      return parsed;
+    } catch (parseError) {
+      logger.warn(`Ignoring ${configPath}: invalid JSON (${parseError instanceof Error ? parseError.message : String(parseError)}).`);
+      return {};
+    }
   } catch {
     return {};
   }
@@ -99,18 +147,23 @@ async function loadConfig() {
   const projectPath = validateProjectPath(projectPathRaw);
   const projectDir = projectPath.endsWith(".xcodeproj") || projectPath.endsWith(".xcworkspace") ? resolvePath(projectPath, "..") : projectPath;
   const projectConfig = await loadProjectConfig(projectDir);
-  const defaultScheme = process.env.XCODE_DEFAULT_SCHEME || projectConfig.default_scheme;
+  const defaultScheme = process.env.XCODE_DEFAULT_SCHEME?.trim() || projectConfig.default_scheme?.trim();
   if (!defaultScheme) {
     logger.warn("No default scheme configured. Set XCODE_DEFAULT_SCHEME or add default_scheme to .xcode-mcp.json");
+  }
+  const derivedDataPath = process.env.XCODE_DERIVED_DATA_PATH?.trim() || void 0;
+  const defaultSimulator = process.env.XCODE_DEFAULT_SIMULATOR?.trim() || projectConfig.default_simulator?.trim();
+  if (defaultSimulator && defaultSimulator.length > 256) {
+    logger.warn("Ignoring XCODE_DEFAULT_SIMULATOR: value exceeds 256 characters.");
   }
   return {
     projectPath,
     projectDir,
     defaultScheme: defaultScheme || "",
-    defaultSimulator: process.env.XCODE_DEFAULT_SIMULATOR || projectConfig.default_simulator,
-    derivedDataPath: process.env.XCODE_DERIVED_DATA_PATH,
-    buildTimeout: parseInt(process.env.XCODE_MCP_BUILD_TIMEOUT || "300", 10),
-    testTimeout: parseInt(process.env.XCODE_MCP_TEST_TIMEOUT || "600", 10),
+    defaultSimulator: defaultSimulator && defaultSimulator.length <= 256 ? defaultSimulator : void 0,
+    derivedDataPath,
+    buildTimeout: parseTimeoutEnv(process.env.XCODE_MCP_BUILD_TIMEOUT, 300),
+    testTimeout: parseTimeoutEnv(process.env.XCODE_MCP_TEST_TIMEOUT, 600),
     projectConfig
   };
 }
@@ -121,13 +174,6 @@ import { resolve as resolvePath2 } from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
-function assertPathInProject(projectDir, filePath) {
-  const resolved = resolvePath2(projectDir, filePath);
-  if (!resolved.startsWith(projectDir)) {
-    throw pathTraversalDetected(filePath);
-  }
-  return resolved;
-}
 function registerProjectTools(server) {
   const config = server.config;
   server.registerTool({
@@ -143,7 +189,11 @@ function registerProjectTools(server) {
       }
     },
     handler: async (args) => {
-      const projectPath = args.project_path || config.projectPath;
+      const rawPath = optionalString(args.project_path, "project_path");
+      if (rawPath && !rawPath.endsWith(".xcodeproj") && !rawPath.endsWith(".xcworkspace")) {
+        throw invalidInput("project_path", "Must point to a .xcodeproj or .xcworkspace.");
+      }
+      const projectPath = rawPath || config.projectPath;
       if (!existsSync2(projectPath)) {
         return {
           content: [{ type: "text", text: JSON.stringify(fileNotFound(projectPath)) }],
@@ -189,7 +239,11 @@ function registerProjectTools(server) {
       }
     },
     handler: async (args) => {
-      const projectPath = args.project_path || config.projectPath;
+      const rawPath = optionalString(args.project_path, "project_path");
+      if (rawPath && !rawPath.endsWith(".xcodeproj") && !rawPath.endsWith(".xcworkspace")) {
+        throw invalidInput("project_path", "Must point to a .xcodeproj or .xcworkspace.");
+      }
+      const projectPath = rawPath || config.projectPath;
       const info = getProjectInfo(projectPath);
       return {
         content: [{ type: "text", text: JSON.stringify(info, null, 2) }]
@@ -242,8 +296,12 @@ function registerProjectTools(server) {
       }
     },
     handler: async (args) => {
-      const targetName = args.target;
-      const fileType = args.file_type;
+      const targetName = optionalString(args.target, "target", 256);
+      const fileType = optionalString(args.file_type, "file_type", 32);
+      const allowedTypes = ["swift", "objc", "storyboard", "xcassets", "plist", "xib", "strings", "json", "entitlements"];
+      if (fileType && !allowedTypes.includes(fileType)) {
+        throw invalidInput("file_type", `Must be one of: ${allowedTypes.join(", ")}.`);
+      }
       const entries = getFileEntries(config.projectPath, targetName);
       let filtered = entries;
       if (fileType) {
@@ -267,9 +325,9 @@ function registerProjectTools(server) {
       required: ["file_path", "target"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
-      const targetName = args.target;
-      const content = args.content;
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      const targetName = requireTargetName(args.target);
+      const content = optionalString(args.content, "content", 10 * 1024 * 1024);
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
       if (!existsSync2(resolvedPath) && content) {
         const { writeFileSync, mkdirSync } = await import("fs");
@@ -313,8 +371,11 @@ function registerProjectTools(server) {
       required: ["file_path", "target"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
-      const targetName = args.target;
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      const targetName = requireTargetName(args.target);
+      if (args.delete_from_disk !== void 0 && typeof args.delete_from_disk !== "boolean") {
+        throw invalidInput("delete_from_disk", "Must be a boolean.");
+      }
       const deleteFromDisk = args.delete_from_disk || false;
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
       try {
@@ -351,10 +412,10 @@ function registerProjectTools(server) {
       required: ["target"]
     },
     handler: async (args) => {
-      const target = args.target;
-      const configuration = args.configuration || "Release";
+      const target = requireTargetName(args.target);
+      const configuration = requireConfigurationName(args.configuration ?? "Release");
       try {
-        const settings = await getBuildSettings(target, configuration);
+        const settings = await getBuildSettings(config.projectPath, target, configuration);
         return {
           content: [{ type: "text", text: JSON.stringify(settings, null, 2) }]
         };
@@ -384,10 +445,10 @@ function registerProjectTools(server) {
       required: ["target", "configuration", "key", "value"]
     },
     handler: async (args) => {
-      const target = args.target;
-      const configuration = args.configuration;
-      const key = args.key;
-      const value = args.value;
+      const target = requireTargetName(args.target);
+      const configuration = requireConfigurationName(args.configuration);
+      const key = requireBuildSettingKey(args.key);
+      const value = requireNonEmptyString(args.value, "value", 4096);
       try {
         setBuildSetting(config.projectPath, target, configuration, key, value);
         return {
@@ -414,7 +475,7 @@ function registerProjectTools(server) {
     },
     handler: async () => {
       try {
-        const { resolvePackageDependencies } = await import("./xcode_runner-UHIPZEAP.js");
+        const { resolvePackageDependencies } = await import("./xcode_runner-IPRFQDIA.js");
         const result = await resolvePackageDependencies(config.projectPath);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
@@ -467,8 +528,8 @@ function registerBuildTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -478,14 +539,16 @@ function registerBuildTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
       const dest = args.destination || config.projectConfig.custom_destinations?.[0];
       try {
         const result = await runBuild({
+          projectPath: config.projectPath,
           scheme,
-          configuration: args.configuration || "Debug",
+          configuration: requireConfigurationName(args.configuration ?? "Debug"),
           destination: dest,
-          clean: args.clean || false,
-          derivedDataPath: args.derived_data_path || config.derivedDataPath,
+          clean: args.clean === true,
+          derivedDataPath: optionalString(args.derived_data_path, "derived_data_path") ?? config.derivedDataPath,
           timeout: config.buildTimeout * 1e3,
           onProgress: (line) => {
             logger.info(`[build] ${line}`);
@@ -523,8 +586,8 @@ function registerBuildTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -534,13 +597,15 @@ function registerBuildTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
       try {
-        const { xcodebuild: xcodebuild2 } = await import("./xcode_runner-UHIPZEAP.js");
+        const { xcodebuild: xcodebuild2 } = await import("./xcode_runner-IPRFQDIA.js");
+        const [projFlag, projPath] = projectFlag(config.projectPath);
         const buildArgs = [
+          projFlag,
+          projPath,
           "-scheme",
           scheme,
-          "-project",
-          config.projectPath,
           "-destination",
           args.destination || "platform=iOS Simulator,name=iPhone 16",
           "build-for-testing"
@@ -550,7 +615,7 @@ function registerBuildTools(server) {
           onProgress: (line) => logger.info(`[build-for-testing] ${line}`)
         });
         const parsed = parseBuildOutput(result.stdout, result.stderr);
-        const success = result.stdout.includes("BUILD SUCCEEDED");
+        const success = result.stdout.includes("BUILD SUCCEEDED") || result.stderr.includes("BUILD SUCCEEDED");
         return {
           content: [{ type: "text", text: JSON.stringify({
             success,
@@ -591,8 +656,8 @@ function registerBuildTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -602,8 +667,13 @@ function registerBuildTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
       try {
         const exportOptions = args.export_options;
+        if (exportOptions !== void 0 && (typeof exportOptions !== "object" || exportOptions === null || Array.isArray(exportOptions))) {
+          const { invalidInput: invalidInput2 } = await import("./error_handler-6MK4SEKP.js");
+          throw invalidInput2("export_options", "Must be an object.");
+        }
         const result = await archiveBuild(scheme, config.projectPath, exportOptions);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -637,17 +707,31 @@ function registerBuildTools(server) {
     handler: async (args) => {
       const results = [];
       try {
-        const { xcodebuild: xcodebuild2 } = await import("./xcode_runner-UHIPZEAP.js");
+        const { xcodebuild: xcodebuild2 } = await import("./xcode_runner-IPRFQDIA.js");
+        const [projFlag, projPath] = projectFlag(config.projectPath);
         const cleanArgs = ["clean"];
         const scheme = args.scheme || config.defaultScheme;
-        if (scheme) cleanArgs.push("-scheme", scheme);
-        cleanArgs.push("-project", config.projectPath);
+        if (scheme) cleanArgs.push("-scheme", requireSchemeName(scheme));
+        cleanArgs.push(projFlag, projPath);
         const result = await xcodebuild2(cleanArgs, { timeout: 12e4 });
         results.push(result.stdout.includes("CLEAN SUCCEEDED") ? "Clean succeeded" : "Clean may have had issues");
-        if (args.derived_data) {
-          const { execSync } = await import("child_process");
-          execSync("rm -rf ~/Library/Developer/Xcode/DerivedData/*", { stdio: "pipe" });
-          results.push("DerivedData wiped");
+        if (args.derived_data === true) {
+          const { homedir: homedir2 } = await import("os");
+          const { join: join4, basename } = await import("path");
+          const { readdir, rm } = await import("fs/promises");
+          const derivedData = join4(homedir2(), "Library", "Developer", "Xcode", "DerivedData");
+          const base = basename(config.projectPath).replace(/\.(xcodeproj|xcworkspace)$/, "");
+          try {
+            const entries = await readdir(derivedData);
+            const ours = entries.filter((d) => d === base || d.startsWith(`${base}-`));
+            for (const dir of ours) {
+              await rm(join4(derivedData, dir), { recursive: true, force: true });
+              results.push(`DerivedData removed: ${dir}`);
+            }
+            if (ours.length === 0) results.push("No DerivedData found for this project");
+          } catch (err) {
+            results.push(`DerivedData wipe skipped: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true, results }) }]
@@ -668,44 +752,21 @@ function registerBuildTools(server) {
       properties: {}
     },
     handler: async () => {
-      const { readdirSync: readdirSync5, readFileSync: readFileSync3, statSync: statSync4 } = await import("fs");
-      const { join: join6 } = await import("path");
-      const { homedir: homedir4 } = await import("os");
-      const derivedData = join6(homedir4(), "Library", "Developer", "Xcode", "DerivedData");
-      try {
-        const dirs = readdirSync5(derivedData);
-        const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-        const matchingDir = dirs.find((d) => d.startsWith(projectName));
-        if (!matchingDir) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({
-              errors: [],
-              warnings: [],
-              message: "No DerivedData found for this project. Build the project first."
-            }, null, 2) }]
-          };
-        }
-        const buildLogDir = join6(derivedData, matchingDir, "Logs", "Build");
-        const logFiles = readdirSync5(buildLogDir).filter((f) => f.endsWith(".xcactivitylog")).map((f) => ({ name: f, time: statSync4(join6(buildLogDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-        if (logFiles.length === 0) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ errors: [], warnings: [], message: "No build logs found." }) }]
-          };
-        }
-        const latestLog = readFileSync3(join6(buildLogDir, logFiles[0].name), "utf-8");
-        const parsed = parseBuildOutput(latestLog, "");
-        return {
-          content: [{ type: "text", text: JSON.stringify(parsed, null, 2) }]
-        };
-      } catch (error) {
+      const { readLatestBuildLog: readLatestBuildLog2 } = await import("./build_log-XXPEUOF6.js");
+      const latest = readLatestBuildLog2(config.projectPath);
+      if (!latest.found) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             errors: [],
             warnings: [],
-            message: `Could not read build logs: ${error instanceof Error ? error.message : String(error)}`
+            message: latest.reason || "No build logs found."
           }, null, 2) }]
         };
       }
+      const parsed = parseBuildOutput(latest.log, "");
+      return {
+        content: [{ type: "text", text: JSON.stringify(parsed, null, 2) }]
+      };
     }
   });
   server.registerTool({
@@ -725,8 +786,8 @@ function registerBuildTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -736,8 +797,9 @@ function registerBuildTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
       try {
-        const result = await runAnalyze(scheme, args.target);
+        const result = await runAnalyze(config.projectPath, scheme, optionalString(args.target, "target", 256));
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
         };
@@ -778,7 +840,7 @@ function registerSimulatorTools(server) {
       required: ["udid"]
     },
     handler: async (args) => {
-      const query = args.udid;
+      const query = requireUdidOrName(args.udid);
       let udid = query;
       if (query.length < 36) {
         const device = await findSimulator(query);
@@ -822,7 +884,7 @@ function registerSimulatorTools(server) {
       required: ["udid"]
     },
     handler: async (args) => {
-      const udid = args.udid;
+      const udid = requireUdidOrName(args.udid);
       try {
         await shutdownSimulator(udid);
         return {
@@ -852,8 +914,10 @@ function registerSimulatorTools(server) {
       required: ["udid", "app_path"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const appPath = requireNonEmptyString(args.app_path, "app_path", 1024);
       try {
-        await installApp(args.udid, args.app_path);
+        await installApp(udid, appPath);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true }) }]
         };
@@ -883,10 +947,25 @@ function registerSimulatorTools(server) {
       required: ["udid", "bundle_id"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
+      if (args.arguments !== void 0) {
+        if (!Array.isArray(args.arguments) || args.arguments.some((a) => typeof a !== "string")) {
+          throw invalidInput("arguments", "Must be an array of strings.");
+        }
+      }
+      if (args.environment !== void 0) {
+        if (typeof args.environment !== "object" || args.environment === null || Array.isArray(args.environment)) {
+          throw invalidInput("environment", "Must be an object of string to string.");
+        }
+        for (const [k, v] of Object.entries(args.environment)) {
+          if (typeof v !== "string") throw invalidInput("environment", `Value for "${k}" must be a string.`);
+        }
+      }
       try {
         const pid = await launchApp(
-          args.udid,
-          args.bundle_id,
+          udid,
+          bundleId,
           args.arguments,
           args.environment
         );
@@ -917,8 +996,10 @@ function registerSimulatorTools(server) {
       required: ["udid", "bundle_id"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
       try {
-        await terminateApp(args.udid, args.bundle_id);
+        await terminateApp(udid, bundleId);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true }) }]
         };
@@ -948,11 +1029,15 @@ function registerSimulatorTools(server) {
       required: ["udid"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = args.bundle_id === void 0 ? void 0 : requireBundleId(args.bundle_id);
+      const lines = clampLines(args.lines, 100);
+      const filter = optionalString(args.filter, "filter", 1024);
       try {
-        const logs = await getSimulatorLogs(args.udid, {
-          bundleId: args.bundle_id,
-          lines: args.lines || 100,
-          filter: args.filter
+        const logs = await getSimulatorLogs(udid, {
+          bundleId,
+          lines,
+          filter
         });
         return {
           content: [{ type: "text", text: JSON.stringify(logs, null, 2) }]
@@ -981,8 +1066,10 @@ function registerSimulatorTools(server) {
       required: ["udid"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const outputPath = optionalString(args.output_path, "output_path");
       try {
-        const path = await screenshotSimulator(args.udid, args.output_path);
+        const path = await screenshotSimulator(udid, outputPath);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true, path }) }]
         };
@@ -1011,11 +1098,14 @@ function registerSimulatorTools(server) {
       required: ["udid", "output_path"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const outputPath = requireNonEmptyString(args.output_path, "output_path");
+      const duration = clampDurationSeconds(args.duration_seconds, 10, 300);
       try {
         const path = await recordSimulator(
-          args.udid,
-          args.output_path,
-          args.duration_seconds || 10
+          udid,
+          outputPath,
+          duration
         );
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true, path }) }]
@@ -1044,8 +1134,10 @@ function registerSimulatorTools(server) {
       required: ["udid", "url"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const url = requireUrl(args.url);
       try {
-        await openURL(args.udid, args.url);
+        await openURL(udid, url);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true }) }]
         };
@@ -1074,8 +1166,11 @@ function registerSimulatorTools(server) {
       required: ["udid", "latitude", "longitude"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const latitude = requireLatitude(args.latitude);
+      const longitude = requireLongitude(args.longitude);
       try {
-        await setSimulatorLocation(args.udid, args.latitude, args.longitude);
+        await setSimulatorLocation(udid, latitude, longitude);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true }) }]
         };
@@ -1104,8 +1199,11 @@ function registerSimulatorTools(server) {
       required: ["udid", "bundle_id", "payload"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
+      const payload = requirePayloadObject(args.payload);
       try {
-        await pushNotification(args.udid, args.bundle_id, args.payload);
+        await pushNotification(udid, bundleId, payload);
         return {
           content: [{ type: "text", text: JSON.stringify({ success: true }) }]
         };
@@ -1132,10 +1230,11 @@ function registerSimulatorTools(server) {
       required: ["udid"]
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
       try {
-        await resetSimulator(args.udid);
+        await resetSimulator(udid);
         return {
-          content: [{ type: "text", text: JSON.stringify({ success: true, udid: args.udid }) }]
+          content: [{ type: "text", text: JSON.stringify({ success: true, udid }) }]
         };
       } catch (error) {
         return {
@@ -1182,6 +1281,13 @@ function parseTestResults(stdout, stderr) {
     durationSeconds = parseFloat(durationMatch[2]);
   }
   const lines = output.split("\n");
+  const seenFailures = /* @__PURE__ */ new Set();
+  const addFailure = (failure) => {
+    const identity = `${failure.className}\0${failure.testName}\0${failure.file ?? ""}\0${failure.line ?? ""}\0${failure.message}`;
+    if (seenFailures.has(identity)) return;
+    seenFailures.add(identity);
+    failures.push(failure);
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] || "";
     const failMatch = line.match(/^\s*(-\[(\w+(?:\s+\w+)?)\s+(\w+)\])|(?:FAIL|error:)\s*(?:-\[(\w+(?:\s+\w+)?)\s+(\w+)\])/);
@@ -1189,7 +1295,7 @@ function parseTestResults(stdout, stderr) {
       const testName = failMatch[1] || `-${failMatch[4]} ${failMatch[5]}`;
       const nextLine = lines[i + 1] || "";
       const fileMatch = nextLine.match(/(.+?):(\d+):\s*(.+)/);
-      failures.push({
+      addFailure({
         testName: testName.replace(/^-\s*\[|\]$/g, "").trim(),
         className: failMatch[2] || failMatch[4] || "",
         file: fileMatch?.[1],
@@ -1199,7 +1305,7 @@ function parseTestResults(stdout, stderr) {
     }
     const modernFailMatch = line.match(/(\w[\w\/]+)\s*:\s*(?:error|FAIL).*?at\s+(.+?):(\d+)/);
     if (modernFailMatch) {
-      failures.push({
+      addFailure({
         testName: modernFailMatch[1],
         className: modernFailMatch[1].split("/")[0] || "",
         file: modernFailMatch[2],
@@ -1264,8 +1370,8 @@ function registerTestingTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -1275,28 +1381,33 @@ function registerTestingTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
+      const [projFlag, projPath] = projectFlag(config.projectPath);
       const buildArgs = [
+        projFlag,
+        projPath,
         "-scheme",
         scheme,
-        "-project",
-        config.projectPath,
         "-destination",
         args.destination || "platform=iOS Simulator,name=iPhone 16",
         "test"
       ];
-      if (args.test_plan) {
-        buildArgs.push("-testPlan", args.test_plan);
+      const testPlan = optionalString(args.test_plan, "test_plan", 256);
+      if (testPlan) {
+        buildArgs.push("-testPlan", testPlan);
       }
-      if (args.test_filter) {
-        buildArgs.push("-only-testing", args.test_filter);
+      const testFilter = optionalString(args.test_filter, "test_filter", 512);
+      if (testFilter) {
+        buildArgs.push("-only-testing", testFilter);
       }
-      if (args.parallel) {
+      if (args.parallel === true) {
         buildArgs.push("-parallel-testing-enabled", "YES");
       } else {
         buildArgs.push("-parallel-testing-enabled", "NO");
       }
-      if (args.result_bundle_path) {
-        buildArgs.push("-resultBundlePath", args.result_bundle_path);
+      const resultBundlePath = optionalString(args.result_bundle_path, "result_bundle_path");
+      if (resultBundlePath) {
+        buildArgs.push("-resultBundlePath", resultBundlePath);
       }
       try {
         const startTime = Date.now();
@@ -1307,7 +1418,7 @@ function registerTestingTools(server) {
         const duration = (Date.now() - startTime) / 1e3;
         const testResults = parseTestResults(result.stdout, result.stderr);
         testResults.durationSeconds = duration;
-        const success = !testResults.failed || testResults.failed === 0;
+        const success = testResults.totalTests > 0 && testResults.failed === 0;
         return {
           content: [{ type: "text", text: JSON.stringify(testResults, null, 2) }],
           isError: !success
@@ -1334,25 +1445,15 @@ function registerTestingTools(server) {
     },
     handler: async (args) => {
       try {
-        const resultPath = args.result_bundle_path;
-        let xcresultPath = resultPath;
+        const { findLatestXcresult } = await import("./build_log-XXPEUOF6.js");
+        const explicitPath = optionalString(args.result_bundle_path, "result_bundle_path");
+        if (explicitPath && !explicitPath.endsWith(".xcresult")) {
+          const { invalidInput: invalidInput2 } = await import("./error_handler-6MK4SEKP.js");
+          throw invalidInput2("result_bundle_path", "Must point to a .xcresult bundle.");
+        }
+        let xcresultPath = explicitPath;
         if (!xcresultPath) {
-          const { readdirSync: readdirSync5, statSync: statSync4 } = await import("fs");
-          const { join: join6 } = await import("path");
-          const { homedir: homedir4 } = await import("os");
-          const derivedData = join6(homedir4(), "Library", "Developer", "Xcode", "DerivedData");
-          const dirs = readdirSync5(derivedData);
-          const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-          const matchingDir = dirs.find((d) => d.startsWith(projectName));
-          if (matchingDir) {
-            const testLogsDir = join6(derivedData, matchingDir, "Logs", "Test");
-            if (existsSync3(testLogsDir)) {
-              const results = readdirSync5(testLogsDir).filter((f) => f.endsWith(".xcresult")).map((f) => ({ name: f, time: statSync4(join6(testLogsDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-              if (results.length > 0 && results[0]) {
-                xcresultPath = join6(testLogsDir, results[0].name);
-              }
-            }
-          }
+          xcresultPath = findLatestXcresult(config.projectPath);
         }
         if (!xcresultPath || !existsSync3(xcresultPath)) {
           return {
@@ -1361,7 +1462,7 @@ function registerTestingTools(server) {
             }) }]
           };
         }
-        const { xcrun: xcrun2 } = await import("./xcode_runner-UHIPZEAP.js");
+        const { xcrun: xcrun2 } = await import("./xcode_runner-IPRFQDIA.js");
         const result = await xcrun2("xcresulttool", ["get", "--format", "json", "--path", xcresultPath]);
         const parsed = JSON.parse(result.stdout);
         return {
@@ -1393,12 +1494,23 @@ function registerTestingTools(server) {
     },
     handler: async (args) => {
       try {
-        const { xcrun: xcrun2 } = await import("./xcode_runner-UHIPZEAP.js");
-        const resultPath = args.result_bundle_path;
+        const { xcrun: xcrun2 } = await import("./xcode_runner-IPRFQDIA.js");
+        const { findLatestXcresult } = await import("./build_log-XXPEUOF6.js");
+        const explicitPath = optionalString(args.result_bundle_path, "result_bundle_path");
+        if (explicitPath && !explicitPath.endsWith(".xcresult")) {
+          const { invalidInput: invalidInput2 } = await import("./error_handler-6MK4SEKP.js");
+          throw invalidInput2("result_bundle_path", "Must point to a .xcresult bundle.");
+        }
+        const resultPath = explicitPath;
         if (resultPath && existsSync3(resultPath)) {
           const report = await xcrun2("xccov", ["view", "--report", "--path", resultPath]);
           const jsonReport = await xcrun2("xccov", ["view", "--report", "--json", "--path", resultPath]);
-          const coverageData = JSON.parse(jsonReport.stdout);
+          let coverageData;
+          try {
+            coverageData = JSON.parse(jsonReport.stdout);
+          } catch {
+            throw new Error("Failed to parse xccov JSON output.");
+          }
           return {
             content: [{ type: "text", text: JSON.stringify({
               summary: report.stdout.slice(0, 2e3),
@@ -1406,25 +1518,12 @@ function registerTestingTools(server) {
             }, null, 2) }]
           };
         }
-        const { homedir: homedir4 } = await import("os");
-        const { join: join6 } = await import("path");
-        const { readdirSync: readdirSync5, statSync: statSync4 } = await import("fs");
-        const derivedData = join6(homedir4(), "Library", "Developer", "Xcode", "DerivedData");
-        const dirs = readdirSync5(derivedData);
-        const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-        const matchingDir = dirs.find((d) => d.startsWith(projectName));
-        if (matchingDir) {
-          const testLogsDir = join6(derivedData, matchingDir, "Logs", "Test");
-          if (existsSync3(testLogsDir)) {
-            const results = readdirSync5(testLogsDir).filter((f) => f.endsWith(".xcresult")).map((f) => ({ name: f, time: statSync4(join6(testLogsDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-            if (results.length > 0 && results[0]) {
-              const latestPath = join6(testLogsDir, results[0].name);
-              const report = await xcrun2("xccov", ["view", "--report", "--path", latestPath]);
-              return {
-                content: [{ type: "text", text: JSON.stringify({ report: report.stdout }) }]
-              };
-            }
-          }
+        const latestPath = findLatestXcresult(config.projectPath);
+        if (latestPath) {
+          const report = await xcrun2("xccov", ["view", "--report", "--path", latestPath]);
+          return {
+            content: [{ type: "text", text: JSON.stringify({ report: report.stdout }) }]
+          };
         }
         return {
           content: [{ type: "text", text: JSON.stringify({ message: "No coverage data found. Run tests with code coverage enabled." }) }]
@@ -1463,8 +1562,8 @@ function registerTestingTools(server) {
       required: ["test_identifier"]
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = args.scheme || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: "text", text: JSON.stringify({
             code: "NO_SCHEME",
@@ -1474,16 +1573,19 @@ function registerTestingTools(server) {
           isError: true
         };
       }
+      const scheme = requireSchemeName(rawScheme);
+      const testIdentifier = requireNonEmptyString(args.test_identifier, "test_identifier", 512);
+      const [projFlag, projPath] = projectFlag(config.projectPath);
       const buildArgs = [
+        projFlag,
+        projPath,
         "-scheme",
         scheme,
-        "-project",
-        config.projectPath,
         "-destination",
         args.destination || "platform=iOS Simulator,name=iPhone 16",
         "test",
         "-only-testing",
-        args.test_identifier
+        testIdentifier
       ];
       try {
         const result = await xcodebuild(buildArgs, {
@@ -1508,14 +1610,8 @@ function registerTestingTools(server) {
 // src/tools/code.ts
 import { existsSync as existsSync4 } from "fs";
 import { readFile as readFile2, writeFile, stat } from "fs/promises";
-import { resolve as resolvePath3 } from "path";
-function assertPathInProject2(projectDir, filePath) {
-  const resolved = resolvePath3(projectDir, filePath);
-  if (!resolved.startsWith(projectDir)) {
-    throw pathTraversalDetected(filePath);
-  }
-  return resolved;
-}
+var MAX_READ_BYTES = 1024 * 1024;
+var MAX_WRITE_BYTES = 10 * 1024 * 1024;
 function registerCodeTools(server) {
   const config = server.config;
   server.registerTool({
@@ -1532,16 +1628,36 @@ function registerCodeTools(server) {
       required: ["file_path"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
-      const resolvedPath = assertPathInProject2(config.projectDir, filePath);
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      const resolvedPath = assertPathInProject(config.projectDir, filePath);
       if (!existsSync4(resolvedPath)) {
         return {
           content: [{ type: "text", text: JSON.stringify(fileNotFound(filePath)) }],
           isError: true
         };
       }
-      const content = await readFile2(resolvedPath, "utf-8");
       const fileStat = await stat(resolvedPath);
+      if (fileStat.size > MAX_READ_BYTES) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            code: "FILE_TOO_LARGE",
+            message: `File is ${(fileStat.size / 1024 / 1024).toFixed(1)} MiB; limit is 1 MiB.`,
+            suggestion: "Use xcode_search_in_project or xcode_get_swift_symbols to inspect large files."
+          }) }],
+          isError: true
+        };
+      }
+      const content = await readFile2(resolvedPath, "utf-8");
+      if (content.includes("\0")) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            code: "BINARY_FILE",
+            message: "File appears to be binary.",
+            suggestion: "xcode_read_file only supports text files."
+          }) }],
+          isError: true
+        };
+      }
       const lines = content.split("\n");
       return {
         content: [{ type: "text", text: JSON.stringify({
@@ -1577,10 +1693,19 @@ function registerCodeTools(server) {
       required: ["file_path", "content"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      if (typeof args.content !== "string") {
+        throw invalidInput("content", "Must be a string.");
+      }
+      if (args.content.length > MAX_WRITE_BYTES) {
+        throw invalidInput("content", "Exceeds the 10 MiB write limit.");
+      }
       const content = args.content;
+      if (args.create_if_missing !== void 0 && typeof args.create_if_missing !== "boolean") {
+        throw invalidInput("create_if_missing", "Must be a boolean.");
+      }
       const createIfMissing = args.create_if_missing !== false;
-      const resolvedPath = assertPathInProject2(config.projectDir, filePath);
+      const resolvedPath = assertPathInProject(config.projectDir, filePath);
       const fileExists = existsSync4(resolvedPath);
       if (!fileExists && !createIfMissing) {
         return {
@@ -1595,8 +1720,8 @@ function registerCodeTools(server) {
       logger.info(`Wrote file: ${resolvedPath}`);
       if (!fileExists && createIfMissing) {
         try {
-          const { getProjectInfo: getProjectInfo2 } = await import("./pbxproj_parser-VGMEPZVV.js");
-          const { addFileToProject: addFileToProject2 } = await import("./pbxproj_writer-BBRZG2DX.js");
+          const { getProjectInfo: getProjectInfo2 } = await import("./pbxproj_parser-AJGXXIID.js");
+          const { addFileToProject: addFileToProject2 } = await import("./pbxproj_writer-LAMI3GPM.js");
           const info = getProjectInfo2(config.projectPath);
           const target = info.targets[0];
           if (target) {
@@ -1637,10 +1762,19 @@ function registerCodeTools(server) {
       required: ["file_path", "old_content", "new_content"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      if (typeof args.old_content !== "string" || args.old_content.length === 0) {
+        throw invalidInput("old_content", "Must be a non-empty string.");
+      }
+      if (typeof args.new_content !== "string") {
+        throw invalidInput("new_content", "Must be a string (may be empty to delete).");
+      }
+      if (args.old_content.length > MAX_WRITE_BYTES || args.new_content.length > MAX_WRITE_BYTES) {
+        throw invalidInput("content", "Exceeds the 10 MiB limit.");
+      }
       const oldContent = args.old_content;
       const newContent = args.new_content;
-      const resolvedPath = assertPathInProject2(config.projectDir, filePath);
+      const resolvedPath = assertPathInProject(config.projectDir, filePath);
       if (!existsSync4(resolvedPath)) {
         return {
           content: [{ type: "text", text: JSON.stringify(fileNotFound(filePath)) }],
@@ -1693,11 +1827,22 @@ function registerCodeTools(server) {
       required: ["file_path"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
-      const resolvedPath = assertPathInProject2(config.projectDir, filePath);
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      const resolvedPath = assertPathInProject(config.projectDir, filePath);
       if (!existsSync4(resolvedPath)) {
         return {
           content: [{ type: "text", text: JSON.stringify(fileNotFound(filePath)) }],
+          isError: true
+        };
+      }
+      const fileStat = await stat(resolvedPath);
+      if (fileStat.size > MAX_READ_BYTES) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            code: "FILE_TOO_LARGE",
+            message: "File exceeds the 1 MiB symbol-extraction limit.",
+            suggestion: "Split the file or search it with xcode_search_in_project."
+          }) }],
           isError: true
         };
       }
@@ -1758,8 +1903,8 @@ function registerCodeTools(server) {
       required: ["file_path"]
     },
     handler: async (args) => {
-      const filePath = args.file_path;
-      const resolvedPath = assertPathInProject2(config.projectDir, filePath);
+      const filePath = requireNonEmptyString(args.file_path, "file_path");
+      const resolvedPath = assertPathInProject(config.projectDir, filePath);
       try {
         const { execFile: execFile3 } = await import("child_process");
         const { promisify: promisify3 } = await import("util");
@@ -1825,8 +1970,14 @@ function registerCodeTools(server) {
       required: ["query"]
     },
     handler: async (args) => {
-      const query = args.query;
-      const fileType = args.file_type;
+      const query = requireNonEmptyString(args.query, "query", 1024);
+      const fileType = args.file_type === void 0 ? void 0 : requireNonEmptyString(args.file_type, "file_type", 32);
+      if (args.case_sensitive !== void 0 && typeof args.case_sensitive !== "boolean") {
+        throw invalidInput("case_sensitive", "Must be a boolean.");
+      }
+      if (args.regex !== void 0 && typeof args.regex !== "boolean") {
+        throw invalidInput("regex", "Must be a boolean.");
+      }
       const caseSensitive = args.case_sensitive || false;
       const useRegex = args.regex || false;
       const { execFile: execFile3 } = await import("child_process");
@@ -1852,7 +2003,7 @@ function registerCodeTools(server) {
       } else {
         grepArgs.push("--include", "*.swift", "--include", "*.m", "--include", "*.mm", "--include", "*.h");
       }
-      grepArgs.push(query, config.projectDir);
+      grepArgs.push("--", query, config.projectDir);
       try {
         const result = await execFileAsync3("grep", grepArgs, { timeout: 3e4 });
         const lines = result.stdout.split("\n").filter(Boolean);
@@ -1888,7 +2039,7 @@ function registerCodeTools(server) {
 }
 
 // src/tools/signing.ts
-import { readdirSync } from "fs";
+import { readdirSync as readdirSync2 } from "fs";
 import { join as join2 } from "path";
 import { homedir } from "os";
 import { execFile as execFile2 } from "child_process";
@@ -1941,7 +2092,17 @@ function registerSigningTools(server) {
     handler: async () => {
       try {
         const profilesDir = join2(homedir(), "Library", "MobileDevice", "Provisioning Profiles");
-        const files = readdirSync(profilesDir).filter((f) => f.endsWith(".mobileprovision"));
+        let files;
+        try {
+          files = readdirSync2(profilesDir).filter((f) => f.endsWith(".mobileprovision"));
+        } catch {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              profiles: [],
+              message: "No provisioning profiles directory found. Install profiles via Xcode first."
+            }, null, 2) }]
+          };
+        }
         const profiles = [];
         for (const file of files) {
           const filePath = join2(profilesDir, file);
@@ -1951,14 +2112,18 @@ function registerSigningTools(server) {
           const bundleIdMatch = content.match(/<key>application-identifier<\/key>\s*<string>(.+?)<\/string>/);
           const teamMatch = content.match(/<key>com\.apple\.developer\.team-identifier<\/key>\s*<string>(.+?)<\/string>/);
           const expiryMatch = content.match(/<key>ExpirationDate<\/key>\s*<date>(.+?)<\/date>/);
-          const devCountMatch = content.match(/<key>ProvisionedDevices<\/key>\s*<array>\s*<string>(.+?)<\/string>/s);
+          let deviceCount = 0;
+          const deviceSection = content.split("ProvisionedDevices")[1];
+          if (deviceSection) {
+            deviceCount = Math.max(0, deviceSection.split("<string>").length - 1);
+          }
           profiles.push({
             file,
             name: nameMatch?.[1] || "Unknown",
             bundle_id: bundleIdMatch?.[1] ? bundleIdMatch[1].replace(/^[A-Z0-9]+\./, "") : "Unknown",
             team_id: teamMatch?.[1] || "Unknown",
             expiry: expiryMatch?.[1] || "Unknown",
-            device_count: devCountMatch ? content.split("ProvisionedDevices")[1]?.split("<string>").length - 1 : 0
+            device_count: deviceCount
           });
         }
         return {
@@ -1991,10 +2156,20 @@ function registerSigningTools(server) {
       required: ["target", "team_id", "bundle_id"]
     },
     handler: async (args) => {
-      const target = args.target;
-      const teamId = args.team_id;
-      const bundleId = args.bundle_id;
+      const target = requireTargetName(args.target);
+      const teamId = requireNonEmptyString(args.team_id, "team_id", 64);
+      if (!/^[A-Z0-9]{10}$/.test(teamId)) {
+        throw invalidInput("team_id", "Must be a 10-character Apple Team ID (e.g. A1B2C3D4E5).");
+      }
+      const bundleId = requireNonEmptyString(args.bundle_id, "bundle_id", 256);
+      if (!/^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z][A-Za-z0-9]*)+$/.test(bundleId)) {
+        throw invalidInput("bundle_id", "Must be a reverse-DNS bundle identifier (e.g. com.example.App).");
+      }
+      if (args.automatic !== void 0 && typeof args.automatic !== "boolean") {
+        throw invalidInput("automatic", "Must be a boolean.");
+      }
       const automatic = args.automatic !== false;
+      const profileName = optionalString(args.profile_name, "profile_name", 256);
       try {
         for (const cfg of ["Debug", "Release"]) {
           const projectPath = server.config.projectPath;
@@ -2004,8 +2179,8 @@ function registerSigningTools(server) {
             setBuildSetting(projectPath, target, cfg, "CODE_SIGN_STYLE", "Automatic");
           } else {
             setBuildSetting(projectPath, target, cfg, "CODE_SIGN_STYLE", "Manual");
-            if (args.profile_name) {
-              setBuildSetting(projectPath, target, cfg, "PROVISIONING_PROFILE_SPECIFIER", args.profile_name);
+            if (profileName) {
+              setBuildSetting(projectPath, target, cfg, "PROVISIONING_PROFILE_SPECIFIER", profileName);
             }
           }
         }
@@ -2041,7 +2216,10 @@ function registerSigningTools(server) {
       required: ["app_path"]
     },
     handler: async (args) => {
-      const appPath = args.app_path;
+      const appPath = requireNonEmptyString(args.app_path, "app_path", 1024);
+      if (!appPath.endsWith(".app")) {
+        throw invalidInput("app_path", "Must point to a .app bundle.");
+      }
       try {
         const result = await execFileAsync2("codesign", ["--verify", "--verbose", appPath]);
         return {
@@ -2067,9 +2245,6 @@ function registerSigningTools(server) {
 }
 
 // src/tools/diagnostics.ts
-import { existsSync as existsSync5, readFileSync, readdirSync as readdirSync2, statSync } from "fs";
-import { join as join3 } from "path";
-import { homedir as homedir2 } from "os";
 function registerDiagnosticsTools(server) {
   const config = server.config;
   server.registerTool({
@@ -2081,29 +2256,13 @@ function registerDiagnosticsTools(server) {
     },
     handler: async () => {
       try {
-        const derivedData = join3(homedir2(), "Library", "Developer", "Xcode", "DerivedData");
-        const dirs = readdirSync2(derivedData);
-        const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-        const matchingDir = dirs.find((d) => d.startsWith(projectName));
-        if (!matchingDir) {
+        const latest = readLatestBuildLog(config.projectPath);
+        if (!latest.found) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ warnings: [], message: "No build logs found. Build the project first." }) }]
+            content: [{ type: "text", text: JSON.stringify({ warnings: [], message: latest.reason || "No build logs found." }) }]
           };
         }
-        const buildLogDir = join3(derivedData, matchingDir, "Logs", "Build");
-        if (!existsSync5(buildLogDir)) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ warnings: [], message: "No build logs found. Build the project first." }) }]
-          };
-        }
-        const logFiles = readdirSync2(buildLogDir).filter((f) => f.endsWith(".xcactivitylog")).map((f) => ({ name: f, time: statSync(join3(buildLogDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-        if (logFiles.length === 0) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ warnings: [], message: "No build logs found." }) }]
-          };
-        }
-        const latestLog = readFileSync(join3(buildLogDir, logFiles[0].name), "utf-8");
-        const parsed = parseBuildOutput(latestLog, "");
+        const parsed = parseBuildOutput(latest.log, "");
         const groupedWarnings = {};
         for (const w of parsed.warnings) {
           const file = w.file || "(unknown)";
@@ -2157,39 +2316,64 @@ function registerDiagnosticsTools(server) {
       }
     },
     handler: async (args) => {
-      const scheme = args.scheme || config.defaultScheme;
-      if (!scheme) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({
-            code: "NO_SCHEME",
-            message: "No scheme specified",
-            suggestion: "Pass a scheme argument."
-          }) }],
-          isError: true
-        };
-      }
+      const scheme = requireSchemeName(args.scheme || config.defaultScheme, "scheme");
+      const template = optionalString(args.template, "template", 128) || "Time Profiler";
+      const durationSeconds = clampDurationSeconds(args.duration_seconds, 10, 300);
+      const destinationRaw = optionalString(args.destination, "destination", 256);
       try {
-        const tmpDir = join3(homedir2(), "tmp");
-        const tracePath = join3(tmpDir, `${scheme}-${Date.now()}.trace`);
+        const { findSimulator: findSimulator2, getAvailableSimulators: getAvailableSimulators2 } = await import("./simulator_manager-T2XHPH5J.js");
+        let udid = destinationRaw;
+        if (udid) {
+          const device = await findSimulator2(udid);
+          if (!device) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                code: "SIMULATOR_NOT_FOUND",
+                message: `No simulator found matching: ${udid}`,
+                suggestion: "Use xcode_list_simulators to see available simulators."
+              }) }],
+              isError: true
+            };
+          }
+          udid = device.udid;
+        } else {
+          const devices = await getAvailableSimulators2();
+          const booted = devices.find((d) => d.state === "Booted");
+          if (!booted) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                code: "NO_BOOTED_SIMULATOR",
+                message: "No booted simulator found.",
+                suggestion: "Boot one with xcode_boot_simulator or pass an explicit destination."
+              }) }],
+              isError: true
+            };
+          }
+          udid = booted.udid;
+        }
+        const { tmpdir } = await import("os");
+        const { join: joinPath } = await import("path");
+        const safeScheme = scheme.replace(/[^A-Za-z0-9._-]+/g, "_");
+        const tracePath = joinPath(tmpdir(), `${safeScheme}-${Date.now()}.trace`);
         await xcrun("xctrace", [
           "record",
           "--template",
-          args.template || "Time Profiler",
+          template,
           "--device",
-          args.destination || "",
+          udid,
           "--time-limit",
-          `${args.duration_seconds || 10}s`,
+          `${durationSeconds}s`,
           "--output",
-          tracePath,
-          "--target",
-          scheme
+          tracePath
         ]);
         return {
           content: [{ type: "text", text: JSON.stringify({
             success: true,
             output_path: tracePath,
-            schema: scheme,
-            template: args.template || "Time Profiler"
+            scheme,
+            udid,
+            template,
+            duration_seconds: durationSeconds
           }, null, 2) }]
         };
       } catch (error) {
@@ -2197,7 +2381,7 @@ function registerDiagnosticsTools(server) {
           content: [{ type: "text", text: JSON.stringify({
             code: "PROFILE_FAILED",
             message: error instanceof Error ? error.message : String(error),
-            suggestion: "Ensure the scheme builds successfully and a simulator is booted."
+            suggestion: "Ensure a simulator is booted and the template name is valid."
           }) }],
           isError: true
         };
@@ -2237,24 +2421,46 @@ function registerDiagnosticsTools(server) {
       required: ["url", "target"]
     },
     handler: async (args) => {
-      const url = args.url;
-      const targetName = args.target;
-      const versionReq = args.version_requirement;
-      const versionType = versionReq?.type || "upToNextMajorVersion";
-      const versionValue = versionReq?.value || "1.0.0";
+      if (typeof args.url !== "string") {
+        const { invalidInput: invalidInput2 } = await import("./error_handler-6MK4SEKP.js");
+        throw invalidInput2("url", "Must be a string.");
+      }
+      const url = args.url.trim();
+      if (!/^https:\/\/[^/\s]+\/.+/.test(url)) {
+        const { invalidInput: invalidInput2 } = await import("./error_handler-6MK4SEKP.js");
+        throw invalidInput2("url", "Must be an https repository URL (e.g. https://github.com/org/Package.git).");
+      }
+      const { requireTargetName: requireTargetName2 } = await import("./validation-A53ZV73I.js");
+      const targetName = requireTargetName2(args.target);
+      const rawReq = args.version_requirement;
+      const allowedReqTypes = ["exact", "upToNextMajorVersion", "upToNextMinorVersion", "branch", "revision"];
+      const versionType = typeof rawReq?.type === "string" ? rawReq.type : "upToNextMajorVersion";
+      const versionValue = typeof rawReq?.value === "string" ? rawReq.value.trim() : "1.0.0";
+      const { invalidInput: invalidInputFn } = await import("./error_handler-6MK4SEKP.js");
+      if (!allowedReqTypes.includes(versionType)) {
+        throw invalidInputFn("version_requirement.type", `Must be one of: ${allowedReqTypes.join(", ")}.`);
+      }
+      if (!versionValue) {
+        throw invalidInputFn("version_requirement.value", "Must be a non-empty version, branch or revision.");
+      }
       try {
-        const packageName = url.split("/").pop()?.replace(/\.git$/, "") || "Package";
-        const { resolvePackageDependencies } = await import("./xcode_runner-UHIPZEAP.js");
+        const { addSPMPackage } = await import("./pbxproj_writer-LAMI3GPM.js");
+        const added = addSPMPackage(config.projectPath, url, {
+          type: versionType,
+          value: versionValue
+        }, targetName);
+        const { resolvePackageDependencies } = await import("./xcode_runner-IPRFQDIA.js");
         const result = await resolvePackageDependencies(config.projectPath);
         return {
           content: [{ type: "text", text: JSON.stringify({
             success: true,
-            package_name: packageName,
+            package_name: added.packageName,
+            product_name: added.productName,
             url,
             version: `${versionType}: ${versionValue}`,
             target: targetName,
             resolved: result,
-            note: "Package reference added. You may need to add the product to your target in Xcode."
+            note: `Linked product "${added.productName}". If the package's product name differs, adjust the XCSwiftPackageProductDependency in Xcode.`
           }, null, 2) }]
         };
       } catch (error) {
@@ -2272,21 +2478,36 @@ function registerDiagnosticsTools(server) {
 }
 
 // src/resources/project_structure.ts
-import { readdirSync as readdirSync3, statSync as statSync2 } from "fs";
-import { join as join4, relative } from "path";
-function buildFileTree(dirPath, projectDir, excludedPaths = []) {
+import { readdirSync as readdirSync3, lstatSync, realpathSync } from "fs";
+import { join as join3, relative } from "path";
+var MAX_TREE_DEPTH = 25;
+var MAX_TREE_ENTRIES = 5e4;
+function buildFileTree(dirPath, projectDir, excludedPaths = [], depth = 0, seen = /* @__PURE__ */ new Set(), budget = { remaining: MAX_TREE_ENTRIES }) {
   const entries = [];
+  if (depth > MAX_TREE_DEPTH || budget.remaining <= 0) return entries;
+  let realDir;
+  try {
+    realDir = realpathSync(dirPath);
+  } catch {
+    return entries;
+  }
+  if (seen.has(realDir)) return entries;
+  seen.add(realDir);
   try {
     const items = readdirSync3(dirPath);
     for (const item of items) {
-      const fullPath = join4(dirPath, item);
+      if (budget.remaining <= 0) break;
+      const fullPath = join3(dirPath, item);
       const relPath = relative(projectDir, fullPath);
+      if (relPath.startsWith("..")) continue;
       if (excludedPaths.some((p) => relPath.startsWith(p))) continue;
       if (item.startsWith(".") || item === "DerivedData" || item === "build") continue;
       try {
-        const stat2 = statSync2(fullPath);
+        const stat2 = lstatSync(fullPath);
+        if (stat2.isSymbolicLink()) continue;
         if (stat2.isDirectory()) {
-          const children = buildFileTree(fullPath, projectDir, excludedPaths);
+          const children = buildFileTree(fullPath, projectDir, excludedPaths, depth + 1, seen, budget);
+          budget.remaining -= 1;
           entries.push({
             name: item,
             type: "directory",
@@ -2320,6 +2541,7 @@ function buildFileTree(dirPath, projectDir, excludedPaths = []) {
             file_type: typeMap[ext] || "other",
             size: stat2.size
           });
+          budget.remaining -= 1;
         }
       } catch {
         continue;
@@ -2389,7 +2611,7 @@ function registerProjectResources(server) {
     description: "List of all available simulators with their state",
     mimeType: "application/json",
     handler: async () => {
-      const { getAvailableSimulators: getAvailableSimulators2 } = await import("./simulator_manager-EAE4YUGU.js");
+      const { getAvailableSimulators: getAvailableSimulators2 } = await import("./simulator_manager-T2XHPH5J.js");
       const simulators = await getAvailableSimulators2();
       return {
         contents: [{
@@ -2403,9 +2625,6 @@ function registerProjectResources(server) {
 }
 
 // src/resources/build_log.ts
-import { existsSync as existsSync6, readFileSync as readFileSync2, readdirSync as readdirSync4, statSync as statSync3 } from "fs";
-import { join as join5 } from "path";
-import { homedir as homedir3 } from "os";
 function registerBuildLogResources(server) {
   const config = server.config;
   server.registerResource({
@@ -2414,32 +2633,12 @@ function registerBuildLogResources(server) {
     description: "Full text of the most recent build log",
     mimeType: "text/plain",
     handler: async () => {
-      const derivedData = join5(homedir3(), "Library", "Developer", "Xcode", "DerivedData");
-      const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-      const dirs = readdirSync4(derivedData);
-      const matchingDir = dirs.find((d) => d.startsWith(projectName));
-      if (!matchingDir) {
-        return {
-          contents: [{ uri: "xcode://build/latest_log", text: "No build logs found. Build the project first.", mimeType: "text/plain" }]
-        };
-      }
-      const buildLogDir = join5(derivedData, matchingDir, "Logs", "Build");
-      if (!existsSync6(buildLogDir)) {
-        return {
-          contents: [{ uri: "xcode://build/latest_log", text: "No build logs found.", mimeType: "text/plain" }]
-        };
-      }
-      const logFiles = readdirSync4(buildLogDir).filter((f) => f.endsWith(".xcactivitylog")).map((f) => ({ name: f, time: statSync3(join5(buildLogDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-      if (logFiles.length === 0) {
-        return {
-          contents: [{ uri: "xcode://build/latest_log", text: "No build logs found.", mimeType: "text/plain" }]
-        };
-      }
-      const logContent = readFileSync2(join5(buildLogDir, logFiles[0].name), "utf-8");
+      const latest = readLatestBuildLog(config.projectPath);
+      const text = latest.found ? latest.log.slice(-5e4) : "No build logs found. Build the project first.";
       return {
         contents: [{
           uri: "xcode://build/latest_log",
-          text: logContent.slice(-5e4),
+          text,
           mimeType: "text/plain"
         }]
       };
@@ -2451,29 +2650,13 @@ function registerBuildLogResources(server) {
     description: "Parsed errors from the latest build",
     mimeType: "application/json",
     handler: async () => {
-      const derivedData = join5(homedir3(), "Library", "Developer", "Xcode", "DerivedData");
-      const projectName = config.projectPath.split("/").pop()?.replace(/\.xcodeproj$/, "") || "";
-      const dirs = readdirSync4(derivedData);
-      const matchingDir = dirs.find((d) => d.startsWith(projectName));
-      if (!matchingDir) {
+      const latest = readLatestBuildLog(config.projectPath);
+      if (!latest.found) {
         return {
           contents: [{ uri: "xcode://build/errors", text: JSON.stringify({ errors: [], warnings: [] }), mimeType: "application/json" }]
         };
       }
-      const buildLogDir = join5(derivedData, matchingDir, "Logs", "Build");
-      if (!existsSync6(buildLogDir)) {
-        return {
-          contents: [{ uri: "xcode://build/errors", text: JSON.stringify({ errors: [], warnings: [] }), mimeType: "application/json" }]
-        };
-      }
-      const logFiles = readdirSync4(buildLogDir).filter((f) => f.endsWith(".xcactivitylog")).map((f) => ({ name: f, time: statSync3(join5(buildLogDir, f)).mtimeMs })).sort((a, b) => b.time - a.time);
-      if (logFiles.length === 0) {
-        return {
-          contents: [{ uri: "xcode://build/errors", text: JSON.stringify({ errors: [], warnings: [] }), mimeType: "application/json" }]
-        };
-      }
-      const logContent = readFileSync2(join5(buildLogDir, logFiles[0].name), "utf-8");
-      const parsed = parseBuildOutput(logContent, "");
+      const parsed = parseBuildOutput(latest.log, "");
       return {
         contents: [{
           uri: "xcode://build/errors",
@@ -2725,6 +2908,12 @@ var XcodeMCPServer = class {
       } catch (error) {
         logger.error(`Tool ${toolName} error:`, error);
         if (error instanceof McpError) throw error;
+        if (error !== null && typeof error === "object" && "code" in error && typeof error.code === "string") {
+          return {
+            content: [{ type: "text", text: JSON.stringify(error) }],
+            isError: true
+          };
+        }
         const msg = error instanceof Error ? error.message : String(error);
         return {
           content: [{ type: "text", text: JSON.stringify({
@@ -2786,18 +2975,29 @@ var XcodeMCPServer = class {
     process.on("uncaughtException", (error) => {
       logger.error("Uncaught exception:", error);
       killAllChildProcesses();
+      process.exitCode = 1;
+      setTimeout(() => process.exit(1), 100).unref?.();
     });
     process.on("unhandledRejection", (reason) => {
       logger.error("Unhandled rejection:", reason);
     });
   }
   registerTool(tool) {
+    if (this.tools.has(tool.name)) {
+      throw new Error(`Duplicate tool registration: ${tool.name}`);
+    }
     this.tools.set(tool.name, tool);
   }
   registerResource(resource) {
+    if (this.resources.has(resource.uri)) {
+      throw new Error(`Duplicate resource registration: ${resource.uri}`);
+    }
     this.resources.set(resource.uri, resource);
   }
   registerPrompt(prompt) {
+    if (this.prompts.has(prompt.name)) {
+      throw new Error(`Duplicate prompt registration: ${prompt.name}`);
+    }
     this.prompts.set(prompt.name, prompt);
   }
   async init() {
@@ -2821,6 +3021,9 @@ var XcodeMCPServer = class {
     registerPrompts(this);
   }
   async start() {
+    if (!this.config) {
+      throw new Error("Server started without init(): call await server.init() first.");
+    }
     this.registerAllTools();
     logger.info(`Registered ${this.tools.size} tools, ${this.resources.size} resources, ${this.prompts.size} prompts`);
     const transport = new StdioServerTransport();

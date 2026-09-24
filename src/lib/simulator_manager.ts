@@ -13,7 +13,21 @@ import type {
 
 export async function listSimulators(): Promise<SimulatorList> {
   const result = await xcrun('simctl', ['list', '--json']);
-  return JSON.parse(result.stdout) as SimulatorList;
+  try {
+    return JSON.parse(result.stdout) as SimulatorList;
+  } catch {
+    throw new Error(`Failed to parse simctl output: ${(result.stderr || result.stdout).slice(0, 500)}`);
+  }
+}
+
+function parseOsVersion(runtime: string): string {
+  // com.apple.CoreSimulator.SimRuntime.iOS-18-2 -> "iOS 18.2"
+  const short = runtime.replace(/^com\.apple\.CoreSimulator\.SimRuntime\./, '');
+  const match = short.match(/^([A-Za-z]+)-(.+)$/);
+  if (match?.[1] && match[2]) {
+    return `${match[1]} ${match[2].replace(/-/g, '.')}`;
+  }
+  return short.replace(/-/g, '.');
 }
 
 export async function getAvailableSimulators(): Promise<SimulatorDevice[]> {
@@ -24,12 +38,11 @@ export async function getAvailableSimulators(): Promise<SimulatorDevice[]> {
     if (!runtimeDevices) continue;
     for (const device of runtimeDevices) {
       if (device.isAvailable) {
-        const osVersion = runtime.replace('com.apple.CoreSimulator.SimRuntime.', '').replace(/-/g, '.').replace(/^(\w+)/, '$1 ');
         devices.push({
           udid: device.udid,
           name: device.name,
           state: device.state,
-          osVersion,
+          osVersion: parseOsVersion(runtime),
           deviceType: device.deviceType,
           runtimeIdentifier: device.runtimeIdentifier || runtime,
           isAvailable: device.isAvailable,
@@ -104,18 +117,18 @@ export async function launchApp(
   args: string[] = [],
   env: Record<string, string> = {}
 ): Promise<number> {
-  const launchArgs = [udid, bundleId];
+  // simctl launch [-w] [--environment NAME=VAL ...] <device> <bundle> [argv]:
+  // options MUST precede the device and bundle identifiers.
+  const launchArgs: string[] = [];
+
+  for (const [key, value] of Object.entries(env)) {
+    launchArgs.push('--environment', `${key}=${value}`);
+  }
+
+  launchArgs.push(udid, bundleId);
 
   if (args.length > 0) {
     launchArgs.push(...args);
-  }
-
-  const envArgs: string[] = [];
-  for (const [key, value] of Object.entries(env)) {
-    envArgs.push(`${key}=${value}`);
-  }
-  if (envArgs.length > 0) {
-    launchArgs.push('--environment', ...envArgs);
   }
 
   const result = await xcrun('simctl', ['launch', ...launchArgs]);
@@ -134,10 +147,9 @@ export async function getSimulatorLogs(
   udid: string,
   options: { bundleId?: string; lines?: number; filter?: string } = {}
 ): Promise<SimulatorLogEntry[]> {
-  const args = ['spawn', udid, 'log', 'show', '--style', 'compact'];
-  if (options.lines) {
-    args.push('--last', `${options.lines}`);
-  }
+  // `log show --last` takes a timespan (5m/1h/boot), not a line count, so we
+  // fetch the stream and slice the last N entries in code instead.
+  const args = ['spawn', udid, 'log', 'show', '--style', 'compact', '--last', 'boot'];
   if (options.filter) {
     args.push('--predicate', options.filter);
   }
@@ -145,7 +157,8 @@ export async function getSimulatorLogs(
   const result = await xcrun('simctl', args);
   const entries: SimulatorLogEntry[] = [];
 
-  for (const line of result.stdout.split('\n').filter(Boolean)) {
+  for (const line of result.stdout.split('\n')) {
+    if (!line) continue;
     const match = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.0-9]*)\s+(.+)$/);
     if (match && match[1] && match[2]) {
       entries.push({
@@ -158,37 +171,80 @@ export async function getSimulatorLogs(
         message: line,
       });
     }
-
-    if (options.lines && entries.length >= options.lines) break;
   }
 
-  return options.bundleId
+  const filtered = options.bundleId
     ? entries.filter(e => e.message.includes(options.bundleId!))
     : entries;
+  const lines = options.lines && options.lines > 0 ? options.lines : filtered.length;
+  return filtered.slice(-lines);
 }
 
 export async function screenshotSimulator(udid: string, outputPath?: string): Promise<string> {
   const path = outputPath || join(tmpdir(), `simulator-${udid}-${Date.now()}.png`);
+  if (!path.toLowerCase().endsWith('.png')) {
+    throw new Error('Screenshot output path must end with .png');
+  }
+  const { mkdir } = await import('node:fs/promises');
+  const { dirname } = await import('node:path');
+  await mkdir(dirname(path), { recursive: true });
   await xcrun('simctl', ['io', udid, 'screenshot', path]);
   return path;
 }
 
 export async function recordSimulator(udid: string, outputPath: string, durationSeconds: number): Promise<string> {
+  if (!Number.isFinite(durationSeconds) || durationSeconds < 1 || durationSeconds > 300) {
+    throw new Error('Recording duration must be between 1 and 300 seconds.');
+  }
+  if (!outputPath.toLowerCase().endsWith('.mp4') && !outputPath.toLowerCase().endsWith('.mov')) {
+    throw new Error('Recording output path must end with .mp4 or .mov');
+  }
   logger.info(`Recording simulator ${udid} for ${durationSeconds}s to ${outputPath}`);
 
-  const processPromise = xcrun('simctl', ['io', udid, 'recordVideo', '--type', 'mp4', outputPath], {
-    timeout: (durationSeconds + 30) * 1000,
+  const { mkdir } = await import('node:fs/promises');
+  const { dirname } = await import('node:path');
+  await mkdir(dirname(outputPath), { recursive: true });
+
+  // simctl recordVideo runs until it receives SIGINT: spawn it directly and
+  // interrupt it after the requested duration (there is no '--stop' subcommand).
+  const { spawn } = await import('node:child_process');
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const child = spawn('xcrun', ['simctl', 'io', udid, 'recordVideo', outputPath], {
+      stdio: 'ignore',
+    });
+    let settled = false;
+    const done = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (err) rejectPromise(err);
+      else resolvePromise();
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGINT');
+      } catch {
+        done(new Error('Failed to stop the recording process.'));
+        return;
+      }
+      // If SIGINT is ignored, escalate shortly after.
+      setTimeout(() => {
+        try {
+          if (child.exitCode === null) child.kill('SIGKILL');
+        } catch { /* already gone */ }
+      }, 5000).unref?.();
+    }, durationSeconds * 1000);
+    timer.unref?.();
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      done(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      // simctl exits 0 on SIGINT; SIGKILL-escalated runs surface here too.
+      if (code === 0 || code === null) done();
+      else done(new Error(`recordVideo exited with code ${code}`));
+    });
   });
-
-  await sleep(durationSeconds * 1000);
-
-  try {
-    await xcrun('simctl', ['io', udid, 'recordVideo', '--stop']);
-  } catch {
-    // Recording may already have been stopped
-  }
-
-  await processPromise.catch(() => {});
   return outputPath;
 }
 
@@ -201,12 +257,25 @@ export async function setSimulatorLocation(udid: string, latitude: number, longi
 }
 
 export async function pushNotification(udid: string, bundleId: string, payload: Record<string, unknown>): Promise<void> {
-  const tmpFile = join(tmpdir(), `simulator-push-${Date.now()}.json`);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Push payload must be a JSON object.');
+  }
+  const serialized = JSON.stringify(payload);
+  if (serialized.length > 64 * 1024) {
+    throw new Error('Push payload exceeds 64KB.');
+  }
+  const { mkdtemp } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'simulator-push-'));
+  const tmpFile = join(dir, 'payload.apns');
   await writeFile(tmpFile, JSON.stringify(payload, null, 2), 'utf-8');
   try {
     await xcrun('simctl', ['push', udid, bundleId, tmpFile]);
   } finally {
     try { await unlink(tmpFile); } catch { /* ok */ }
+    try {
+      const { rmdir } = await import('node:fs/promises');
+      await rmdir(dir);
+    } catch { /* ok */ }
   }
 }
 
@@ -214,7 +283,13 @@ export async function resetSimulator(udid: string): Promise<void> {
   const state = await getSimulatorState(udid);
   if (state.state === 'Booted') {
     await shutdownSimulator(udid);
-    await sleep(2000);
+    // Poll until shutdown completes instead of sleeping a fixed 2s.
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const current = await getSimulatorState(udid);
+      if (current.state !== 'Booted') break;
+      await sleep(1000);
+    }
   }
   await xcrun('simctl', ['erase', udid]);
   logger.info(`Simulator ${udid} reset to factory state`);

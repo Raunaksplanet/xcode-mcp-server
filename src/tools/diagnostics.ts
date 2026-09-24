@@ -1,8 +1,7 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import type { XcodeMCPServer } from '../server.js';
 import { xcrun, parseBuildOutput } from '../lib/xcode_runner.js';
+import { readLatestBuildLog } from '../lib/build_log.js';
+import { requireSchemeName, optionalString, clampDurationSeconds } from '../lib/validation.js';
 
 export function registerDiagnosticsTools(server: XcodeMCPServer): void {
   const config = server.config;
@@ -16,37 +15,13 @@ export function registerDiagnosticsTools(server: XcodeMCPServer): void {
     },
     handler: async () => {
       try {
-        const derivedData = join(homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
-        const dirs = readdirSync(derivedData);
-        const projectName = config.projectPath.split('/').pop()?.replace(/\.xcodeproj$/, '') || '';
-        const matchingDir = dirs.find(d => d.startsWith(projectName));
-
-        if (!matchingDir) {
+        const latest = readLatestBuildLog(config.projectPath);
+        if (!latest.found) {
           return {
-            content: [{ type: 'text', text: JSON.stringify({ warnings: [], message: 'No build logs found. Build the project first.' }) }],
+            content: [{ type: 'text', text: JSON.stringify({ warnings: [], message: latest.reason || 'No build logs found.' }) }],
           };
         }
-
-        const buildLogDir = join(derivedData, matchingDir, 'Logs', 'Build');
-        if (!existsSync(buildLogDir)) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ warnings: [], message: 'No build logs found. Build the project first.' }) }],
-          };
-        }
-
-        const logFiles = readdirSync(buildLogDir)
-          .filter(f => f.endsWith('.xcactivitylog'))
-          .map(f => ({ name: f, time: statSync(join(buildLogDir, f)).mtimeMs }))
-          .sort((a, b) => b.time - a.time);
-
-        if (logFiles.length === 0) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ warnings: [], message: 'No build logs found.' }) }],
-          };
-        }
-
-        const latestLog = readFileSync(join(buildLogDir, logFiles[0]!.name), 'utf-8');
-        const parsed = parseBuildOutput(latestLog, '');
+        const parsed = parseBuildOutput(latest.log, '');
 
         const groupedWarnings: Record<string, typeof parsed.warnings> = {};
         for (const w of parsed.warnings) {
@@ -103,37 +78,66 @@ export function registerDiagnosticsTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({
-            code: 'NO_SCHEME',
-            message: 'No scheme specified',
-            suggestion: 'Pass a scheme argument.',
-          }) }],
-          isError: true,
-        };
-      }
+      const scheme = requireSchemeName((args.scheme as string) || config.defaultScheme, 'scheme');
+      const template = optionalString(args.template, 'template', 128) || 'Time Profiler';
+      const durationSeconds = clampDurationSeconds(args.duration_seconds, 10, 300);
+      const destinationRaw = optionalString(args.destination, 'destination', 256);
 
       try {
-        const tmpDir = join(homedir(), 'tmp');
-        const tracePath = join(tmpDir, `${scheme}-${Date.now()}.trace`);
+        const { findSimulator, getAvailableSimulators } = await import('../lib/simulator_manager.js');
+        let udid = destinationRaw;
+        if (udid) {
+          const device = await findSimulator(udid);
+          if (!device) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                code: 'SIMULATOR_NOT_FOUND',
+                message: `No simulator found matching: ${udid}`,
+                suggestion: 'Use xcode_list_simulators to see available simulators.',
+              }) }],
+              isError: true,
+            };
+          }
+          udid = device.udid;
+        } else {
+          const devices = await getAvailableSimulators();
+          const booted = devices.find((d) => d.state === 'Booted');
+          if (!booted) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                code: 'NO_BOOTED_SIMULATOR',
+                message: 'No booted simulator found.',
+                suggestion: 'Boot one with xcode_boot_simulator or pass an explicit destination.',
+              }) }],
+              isError: true,
+            };
+          }
+          udid = booted.udid;
+        }
 
+        const { tmpdir } = await import('node:os');
+        const { join: joinPath } = await import('node:path');
+        const safeScheme = scheme.replace(/[^A-Za-z0-9._-]+/g, '_');
+        const tracePath = joinPath(tmpdir(), `${safeScheme}-${Date.now()}.trace`);
+
+        // Device-only recording (no --target): valid for all templates and
+        // does not require a scheme-named runnable product.
         await xcrun('xctrace', [
           'record',
-          '--template', (args.template as string) || 'Time Profiler',
-          '--device', (args.destination as string) || '',
-          '--time-limit', `${(args.duration_seconds as number) || 10}s`,
+          '--template', template,
+          '--device', udid,
+          '--time-limit', `${durationSeconds}s`,
           '--output', tracePath,
-          '--target', scheme,
         ]);
 
         return {
           content: [{ type: 'text', text: JSON.stringify({
             success: true,
             output_path: tracePath,
-            schema: scheme,
-            template: args.template || 'Time Profiler',
+            scheme,
+            udid,
+            template,
+            duration_seconds: durationSeconds,
           }, null, 2) }],
         };
       } catch (error) {
@@ -141,7 +145,7 @@ export function registerDiagnosticsTools(server: XcodeMCPServer): void {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'PROFILE_FAILED',
             message: error instanceof Error ? error.message : String(error),
-            suggestion: 'Ensure the scheme builds successfully and a simulator is booted.',
+            suggestion: 'Ensure a simulator is booted and the template name is valid.',
           }) }],
           isError: true,
         };
@@ -182,14 +186,36 @@ export function registerDiagnosticsTools(server: XcodeMCPServer): void {
       required: ['url', 'target'],
     },
     handler: async (args) => {
-      const url = args.url as string;
-      const targetName = args.target as string;
-      const versionReq = args.version_requirement as { type?: string; value?: string } | undefined;
-      const versionType = versionReq?.type || 'upToNextMajorVersion';
-      const versionValue = versionReq?.value || '1.0.0';
+      if (typeof args.url !== 'string') {
+        const { invalidInput } = await import('../lib/error_handler.js');
+        throw invalidInput('url', 'Must be a string.');
+      }
+      const url = args.url.trim();
+      if (!/^https:\/\/[^/\s]+\/.+/.test(url)) {
+        const { invalidInput } = await import('../lib/error_handler.js');
+        throw invalidInput('url', 'Must be an https repository URL (e.g. https://github.com/org/Package.git).');
+      }
+      const { requireTargetName } = await import('../lib/validation.js');
+      const targetName = requireTargetName(args.target);
+
+      const rawReq = args.version_requirement as { type?: unknown; value?: unknown } | undefined;
+      const allowedReqTypes = ['exact', 'upToNextMajorVersion', 'upToNextMinorVersion', 'branch', 'revision'];
+      const versionType = (typeof rawReq?.type === 'string' ? rawReq.type : 'upToNextMajorVersion');
+      const versionValue = (typeof rawReq?.value === 'string' ? rawReq.value.trim() : '1.0.0');
+      const { invalidInput: invalidInputFn } = await import('../lib/error_handler.js');
+      if (!allowedReqTypes.includes(versionType)) {
+        throw invalidInputFn('version_requirement.type', `Must be one of: ${allowedReqTypes.join(', ')}.`);
+      }
+      if (!versionValue) {
+        throw invalidInputFn('version_requirement.value', 'Must be a non-empty version, branch or revision.');
+      }
 
       try {
-        const packageName = url.split('/').pop()?.replace(/\.git$/, '') || 'Package';
+        const { addSPMPackage } = await import('../lib/pbxproj_writer.js');
+        const added = addSPMPackage(config.projectPath, url, {
+          type: versionType as 'exact' | 'upToNextMajorVersion' | 'upToNextMinorVersion' | 'branch' | 'revision',
+          value: versionValue,
+        }, targetName);
 
         const { resolvePackageDependencies } = await import('../lib/xcode_runner.js');
         const result = await resolvePackageDependencies(config.projectPath);
@@ -197,12 +223,13 @@ export function registerDiagnosticsTools(server: XcodeMCPServer): void {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             success: true,
-            package_name: packageName,
+            package_name: added.packageName,
+            product_name: added.productName,
             url,
             version: `${versionType}: ${versionValue}`,
             target: targetName,
             resolved: result,
-            note: 'Package reference added. You may need to add the product to your target in Xcode.',
+            note: `Linked product "${added.productName}". If the package's product name differs, adjust the XCSwiftPackageProductDependency in Xcode.`,
           }, null, 2) }],
         };
       } catch (error) {

@@ -52,6 +52,48 @@ export function killAllChildProcesses(): void {
   trackedProcesses.clear();
 }
 
+export interface ExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+}
+
+// Simple FIFO semaphore to bound concurrent heavyweight CLI calls
+// (xcodebuild corrupts DerivedData when run fully in parallel).
+const MAX_CONCURRENT_BUILDS = 2;
+let activeBuilds = 0;
+const buildQueue: Array<() => void> = [];
+
+function acquireBuildSlot(): Promise<() => void> {
+  if (activeBuilds < MAX_CONCURRENT_BUILDS) {
+    activeBuilds++;
+    return Promise.resolve(releaseBuildSlot);
+  }
+  return new Promise((resolve) => {
+    buildQueue.push(() => {
+      activeBuilds++;
+      resolve(releaseBuildSlot);
+    });
+  });
+}
+
+function releaseBuildSlot(): void {
+  activeBuilds = Math.max(0, activeBuilds - 1);
+  const next = buildQueue.shift();
+  if (next) next();
+}
+
+/** Wrap an async fn so at most MAX_CONCURRENT_BUILDS run at once. */
+export async function withBuildSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const release = await acquireBuildSlot();
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 export function createExec(
   command: string,
   args: string[],
@@ -60,14 +102,21 @@ export function createExec(
     onStdout?: (line: string) => void;
     onStderr?: (line: string) => void;
   } = {}
-): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     logger.debug(`exec: ${command} ${args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`);
 
+    // Strip our custom options before passing to execFile (it does not know them).
+    const { timeout, onStdout, onStderr, ...execOptions } = options;
+
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+
     const child = execFile(command, args, {
-      ...options,
-      maxBuffer: 100 * 1024 * 1024,
+      ...execOptions,
+      maxBuffer: 25 * 1024 * 1024,
     }, (error, stdout, stderr) => {
+      if (timer) clearTimeout(timer);
       if (child.pid != null) {
         untrackProcess(child.pid);
       }
@@ -75,47 +124,69 @@ export function createExec(
         reject(new Error(`Command not found: ${command}. Is Xcode installed?`));
         return;
       }
+      // execFile reports timeouts with killed===true / signal SIGTERM.
+      const execError = error as (Error & { code?: unknown; killed?: boolean; signal?: string }) | null;
+      if (execError?.killed || timedOut) {
+        timedOut = true;
+      }
+      let exitCode: number | null;
+      if (typeof execError?.code === 'number') {
+        exitCode = execError.code;
+      } else if (execError) {
+        exitCode = 1;
+      } else {
+        exitCode = 0;
+      }
       resolve({
         stdout: typeof stdout === 'string' ? stdout : (stdout?.toString() || ''),
         stderr: typeof stderr === 'string' ? stderr : (stderr?.toString() || ''),
-        exitCode: error?.code === 'ENOENT' ? -1 : (error?.code ? parseInt(String(error.code), 10) || 1 : 0),
+        exitCode,
+        timedOut,
       });
     });
 
     if (child.pid != null) {
       trackProcess(command, args, () => {
-        child.kill('SIGTERM');
+        try { child.kill('SIGTERM'); } catch { /* ok */ }
         setTimeout(() => {
           try { child.kill('SIGKILL'); } catch { /* ok */ }
-        }, 5000);
+        }, 5000).unref?.();
       }, child.pid);
     }
 
-    if (options.timeout && child.pid != null) {
-      const timer = setTimeout(() => {
+    if (timeout && timeout > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
         try {
           child.kill('SIGTERM');
-          logger.warn(`Process ${child.pid} timed out after ${options.timeout}ms`);
+          logger.warn(`Process ${child.pid} timed out after ${timeout}ms`);
         } catch { /* ok */ }
-      }, options.timeout);
-
-      child.on('close', () => clearTimeout(timer));
+        // Give the process a grace period, then force-kill so execFile's
+        // callback fires and the promise always settles.
+        setTimeout(() => {
+          try {
+            if (child.exitCode === null) child.kill('SIGKILL');
+          } catch { /* ok */ }
+        }, 5000).unref?.();
+      }, timeout);
+      // Do not keep the event loop alive just for the timeout timer.
+      timer.unref?.();
     }
 
-    if (options.onStdout && child.stdout) {
+    if (onStdout && child.stdout) {
       child.stdout.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n').filter(Boolean);
         for (const line of lines) {
-          options.onStdout!(line);
+          try { onStdout(line); } catch { /* caller callback must not crash exec */ }
         }
       });
     }
 
-    if (options.onStderr && child.stderr) {
+    if (onStderr && child.stderr) {
       child.stderr.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n').filter(Boolean);
         for (const line of lines) {
-          options.onStderr!(line);
+          try { onStderr!(line); } catch { /* ok */ }
         }
       });
     }

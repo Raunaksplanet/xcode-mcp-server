@@ -2,6 +2,12 @@ import type { XcodeMCPServer } from '../server.js';
 import { runBuild, archiveBuild, runAnalyze, parseBuildOutput } from '../lib/xcode_runner.js';
 import { logger } from '../lib/logger.js';
 import { buildFailed } from '../lib/error_handler.js';
+import { projectFlag } from '../lib/validation.js';
+import {
+  requireSchemeName,
+  requireConfigurationName,
+  optionalString,
+} from '../lib/validation.js';
 
 export function registerBuildTools(server: XcodeMCPServer): void {
   const config = server.config;
@@ -37,8 +43,8 @@ export function registerBuildTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -48,16 +54,18 @@ export function registerBuildTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
 
       const dest = (args.destination as string) || config.projectConfig.custom_destinations?.[0];
 
       try {
         const result = await runBuild({
+          projectPath: config.projectPath,
           scheme,
-          configuration: (args.configuration as string) || 'Debug',
+          configuration: requireConfigurationName(args.configuration ?? 'Debug'),
           destination: dest,
-          clean: (args.clean as boolean) || false,
-          derivedDataPath: (args.derived_data_path as string) || config.derivedDataPath,
+          clean: args.clean === true,
+          derivedDataPath: optionalString(args.derived_data_path, 'derived_data_path') ?? config.derivedDataPath,
           timeout: config.buildTimeout * 1000,
           onProgress: (line) => {
             logger.info(`[build] ${line}`);
@@ -97,8 +105,8 @@ export function registerBuildTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -108,12 +116,14 @@ export function registerBuildTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
 
       try {
         const { xcodebuild } = await import('../lib/xcode_runner.js');
+        const [projFlag, projPath] = projectFlag(config.projectPath);
         const buildArgs = [
+          projFlag, projPath,
           '-scheme', scheme,
-          '-project', config.projectPath,
           '-destination', (args.destination as string) || 'platform=iOS Simulator,name=iPhone 16',
           'build-for-testing',
         ];
@@ -124,7 +134,7 @@ export function registerBuildTools(server: XcodeMCPServer): void {
         });
 
         const parsed = parseBuildOutput(result.stdout, result.stderr);
-        const success = result.stdout.includes('BUILD SUCCEEDED');
+        const success = result.stdout.includes('BUILD SUCCEEDED') || result.stderr.includes('BUILD SUCCEEDED');
 
         return {
           content: [{ type: 'text', text: JSON.stringify({
@@ -167,8 +177,8 @@ export function registerBuildTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -178,9 +188,14 @@ export function registerBuildTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
 
       try {
         const exportOptions = args.export_options as Record<string, unknown> | undefined;
+        if (exportOptions !== undefined && (typeof exportOptions !== 'object' || exportOptions === null || Array.isArray(exportOptions))) {
+          const { invalidInput } = await import('../lib/error_handler.js');
+          throw invalidInput('export_options', 'Must be an object.');
+        }
         const result = await archiveBuild(scheme, config.projectPath, exportOptions);
 
         return {
@@ -218,18 +233,34 @@ export function registerBuildTools(server: XcodeMCPServer): void {
 
       try {
         const { xcodebuild } = await import('../lib/xcode_runner.js');
+        const [projFlag, projPath] = projectFlag(config.projectPath);
         const cleanArgs = ['clean'];
         const scheme = (args.scheme as string) || config.defaultScheme;
-        if (scheme) cleanArgs.push('-scheme', scheme);
-        cleanArgs.push('-project', config.projectPath);
+        if (scheme) cleanArgs.push('-scheme', requireSchemeName(scheme));
+        cleanArgs.push(projFlag, projPath);
 
         const result = await xcodebuild(cleanArgs, { timeout: 120000 });
         results.push(result.stdout.includes('CLEAN SUCCEEDED') ? 'Clean succeeded' : 'Clean may have had issues');
 
-        if (args.derived_data) {
-          const { execSync } = await import('node:child_process');
-          execSync('rm -rf ~/Library/Developer/Xcode/DerivedData/*', { stdio: 'pipe' });
-          results.push('DerivedData wiped');
+        if (args.derived_data === true) {
+          // Scoped wipe: only this project's DerivedData directories, never
+          // the whole ~/Library/Developer/Xcode/DerivedData tree.
+          const { homedir } = await import('node:os');
+          const { join, basename } = await import('node:path');
+          const { readdir, rm } = await import('node:fs/promises');
+          const derivedData = join(homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
+          const base = basename(config.projectPath).replace(/\.(xcodeproj|xcworkspace)$/, '');
+          try {
+            const entries = await readdir(derivedData);
+            const ours = entries.filter((d) => d === base || d.startsWith(`${base}-`));
+            for (const dir of ours) {
+              await rm(join(derivedData, dir), { recursive: true, force: true });
+              results.push(`DerivedData removed: ${dir}`);
+            }
+            if (ours.length === 0) results.push('No DerivedData found for this project');
+          } catch (err) {
+            results.push(`DerivedData wipe skipped: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
 
         return {
@@ -252,54 +283,22 @@ export function registerBuildTools(server: XcodeMCPServer): void {
       properties: {},
     },
     handler: async () => {
-      const { readdirSync, readFileSync, statSync } = await import('node:fs');
-      const { join } = await import('node:path');
-      const { homedir } = await import('node:os');
-
-      const derivedData = join(homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
-
-      try {
-        const dirs = readdirSync(derivedData);
-        const projectName = config.projectPath.split('/').pop()?.replace(/\.xcodeproj$/, '') || '';
-        const matchingDir = dirs.find(d => d.startsWith(projectName));
-
-        if (!matchingDir) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({
-              errors: [],
-              warnings: [],
-              message: 'No DerivedData found for this project. Build the project first.',
-            }, null, 2) }],
-          };
-        }
-
-        const buildLogDir = join(derivedData, matchingDir, 'Logs', 'Build');
-        const logFiles = readdirSync(buildLogDir)
-          .filter(f => f.endsWith('.xcactivitylog'))
-          .map(f => ({ name: f, time: statSync(join(buildLogDir, f)).mtimeMs }))
-          .sort((a, b) => b.time - a.time);
-
-        if (logFiles.length === 0) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ errors: [], warnings: [], message: 'No build logs found.' }) }],
-          };
-        }
-
-        const latestLog = readFileSync(join(buildLogDir, logFiles[0]!.name), 'utf-8');
-        const parsed = parseBuildOutput(latestLog, '');
-
-        return {
-          content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
-        };
-      } catch (error) {
+      const { readLatestBuildLog } = await import('../lib/build_log.js');
+      const latest = readLatestBuildLog(config.projectPath);
+      if (!latest.found) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             errors: [],
             warnings: [],
-            message: `Could not read build logs: ${error instanceof Error ? error.message : String(error)}`,
+            message: latest.reason || 'No build logs found.',
           }, null, 2) }],
         };
       }
+      const parsed = parseBuildOutput(latest.log, '');
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
+      };
     },
   });
 
@@ -320,8 +319,8 @@ export function registerBuildTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -331,9 +330,10 @@ export function registerBuildTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
 
       try {
-        const result = await runAnalyze(scheme, args.target as string | undefined);
+        const result = await runAnalyze(config.projectPath, scheme, optionalString(args.target, 'target', 256));
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };

@@ -3,6 +3,7 @@ import type { XcodeMCPServer } from '../server.js';
 import { xcodebuild } from '../lib/xcode_runner.js';
 import { logger } from '../lib/logger.js';
 import { testFailure } from '../lib/error_handler.js';
+import { projectFlag, requireSchemeName, requireNonEmptyString, optionalString } from '../lib/validation.js';
 import type { TestResult, TestFailure } from '../types/xcodebuild.js';
 
 function parseTestResults(stdout: string, stderr: string): TestResult {
@@ -40,6 +41,14 @@ function parseTestResults(stdout: string, stderr: string): TestResult {
   }
 
   const lines = output.split('\n');
+  const seenFailures = new Set<string>();
+  const addFailure = (failure: TestFailure): void => {
+    // The two patterns below can match the same line: dedupe on identity.
+    const identity = `${failure.className}\u0000${failure.testName}\u0000${failure.file ?? ''}\u0000${failure.line ?? ''}\u0000${failure.message}`;
+    if (seenFailures.has(identity)) return;
+    seenFailures.add(identity);
+    failures.push(failure);
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] || '';
 
@@ -48,7 +57,7 @@ function parseTestResults(stdout: string, stderr: string): TestResult {
       const testName = failMatch[1] || `-${failMatch[4]} ${failMatch[5]}`;
       const nextLine = lines[i + 1] || '';
       const fileMatch = nextLine.match(/(.+?):(\d+):\s*(.+)/);
-      failures.push({
+      addFailure({
         testName: testName.replace(/^-\s*\[|\]$/g, '').trim(),
         className: failMatch[2] || failMatch[4] || '',
         file: fileMatch?.[1],
@@ -59,7 +68,7 @@ function parseTestResults(stdout: string, stderr: string): TestResult {
 
     const modernFailMatch = line.match(/(\w[\w\/]+)\s*:\s*(?:error|FAIL).*?at\s+(.+?):(\d+)/);
     if (modernFailMatch) {
-      failures.push({
+      addFailure({
         testName: modernFailMatch[1]!,
         className: modernFailMatch[1]!.split('/')[0] || '',
         file: modernFailMatch[2],
@@ -128,8 +137,8 @@ export function registerTestingTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -139,30 +148,35 @@ export function registerTestingTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
 
+      const [projFlag, projPath] = projectFlag(config.projectPath);
       const buildArgs = [
+        projFlag, projPath,
         '-scheme', scheme,
-        '-project', config.projectPath,
         '-destination', (args.destination as string) || 'platform=iOS Simulator,name=iPhone 16',
         'test',
       ];
 
-      if (args.test_plan) {
-        buildArgs.push('-testPlan', args.test_plan as string);
+      const testPlan = optionalString(args.test_plan, 'test_plan', 256);
+      if (testPlan) {
+        buildArgs.push('-testPlan', testPlan);
       }
 
-      if (args.test_filter) {
-        buildArgs.push('-only-testing', args.test_filter as string);
+      const testFilter = optionalString(args.test_filter, 'test_filter', 512);
+      if (testFilter) {
+        buildArgs.push('-only-testing', testFilter);
       }
 
-      if (args.parallel) {
+      if (args.parallel === true) {
         buildArgs.push('-parallel-testing-enabled', 'YES');
       } else {
         buildArgs.push('-parallel-testing-enabled', 'NO');
       }
 
-      if (args.result_bundle_path) {
-        buildArgs.push('-resultBundlePath', args.result_bundle_path as string);
+      const resultBundlePath = optionalString(args.result_bundle_path, 'result_bundle_path');
+      if (resultBundlePath) {
+        buildArgs.push('-resultBundlePath', resultBundlePath);
       }
 
       try {
@@ -176,7 +190,8 @@ export function registerTestingTools(server: XcodeMCPServer): void {
         const testResults = parseTestResults(result.stdout, result.stderr);
         testResults.durationSeconds = duration;
 
-        const success = !testResults.failed || testResults.failed === 0;
+        // A run that parsed zero tests is inconclusive, never a success.
+        const success = testResults.totalTests > 0 && testResults.failed === 0;
 
         return {
           content: [{ type: 'text', text: JSON.stringify(testResults, null, 2) }],
@@ -205,31 +220,16 @@ export function registerTestingTools(server: XcodeMCPServer): void {
     },
     handler: async (args) => {
       try {
-        const resultPath = args.result_bundle_path as string | undefined;
-        let xcresultPath = resultPath;
+        const { findLatestXcresult } = await import('../lib/build_log.js');
+        const explicitPath = optionalString(args.result_bundle_path, 'result_bundle_path');
+        if (explicitPath && !explicitPath.endsWith('.xcresult')) {
+          const { invalidInput } = await import('../lib/error_handler.js');
+          throw invalidInput('result_bundle_path', 'Must point to a .xcresult bundle.');
+        }
+        let xcresultPath = explicitPath;
 
         if (!xcresultPath) {
-          const { readdirSync, statSync } = await import('node:fs');
-          const { join } = await import('node:path');
-          const { homedir } = await import('node:os');
-
-          const derivedData = join(homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
-          const dirs = readdirSync(derivedData);
-          const projectName = config.projectPath.split('/').pop()?.replace(/\.xcodeproj$/, '') || '';
-          const matchingDir = dirs.find(d => d.startsWith(projectName));
-
-          if (matchingDir) {
-            const testLogsDir = join(derivedData, matchingDir, 'Logs', 'Test');
-            if (existsSync(testLogsDir)) {
-              const results = readdirSync(testLogsDir)
-                .filter(f => f.endsWith('.xcresult'))
-                .map(f => ({ name: f, time: statSync(join(testLogsDir, f)).mtimeMs }))
-                .sort((a, b) => b.time - a.time);
-              if (results.length > 0 && results[0]) {
-                xcresultPath = join(testLogsDir, results[0].name);
-              }
-            }
-          }
+          xcresultPath = findLatestXcresult(config.projectPath);
         }
 
         if (!xcresultPath || !existsSync(xcresultPath)) {
@@ -275,12 +275,23 @@ export function registerTestingTools(server: XcodeMCPServer): void {
     handler: async (args) => {
       try {
         const { xcrun } = await import('../lib/xcode_runner.js');
-        const resultPath = args.result_bundle_path as string | undefined;
+        const { findLatestXcresult } = await import('../lib/build_log.js');
+        const explicitPath = optionalString(args.result_bundle_path, 'result_bundle_path');
+        if (explicitPath && !explicitPath.endsWith('.xcresult')) {
+          const { invalidInput } = await import('../lib/error_handler.js');
+          throw invalidInput('result_bundle_path', 'Must point to a .xcresult bundle.');
+        }
+        const resultPath = explicitPath;
 
         if (resultPath && existsSync(resultPath)) {
           const report = await xcrun('xccov', ['view', '--report', '--path', resultPath]);
           const jsonReport = await xcrun('xccov', ['view', '--report', '--json', '--path', resultPath]);
-          const coverageData = JSON.parse(jsonReport.stdout);
+          let coverageData: unknown;
+          try {
+            coverageData = JSON.parse(jsonReport.stdout);
+          } catch {
+            throw new Error('Failed to parse xccov JSON output.');
+          }
 
           return {
             content: [{ type: 'text', text: JSON.stringify({
@@ -290,29 +301,12 @@ export function registerTestingTools(server: XcodeMCPServer): void {
           };
         }
 
-        const { homedir } = await import('node:os');
-        const { join } = await import('node:path');
-        const { readdirSync, statSync } = await import('node:fs');
-        const derivedData = join(homedir(), 'Library', 'Developer', 'Xcode', 'DerivedData');
-        const dirs = readdirSync(derivedData);
-        const projectName = config.projectPath.split('/').pop()?.replace(/\.xcodeproj$/, '') || '';
-        const matchingDir = dirs.find(d => d.startsWith(projectName));
-
-        if (matchingDir) {
-          const testLogsDir = join(derivedData, matchingDir, 'Logs', 'Test');
-          if (existsSync(testLogsDir)) {
-            const results = readdirSync(testLogsDir)
-              .filter(f => f.endsWith('.xcresult'))
-              .map(f => ({ name: f, time: statSync(join(testLogsDir, f)).mtimeMs }))
-              .sort((a, b) => b.time - a.time);
-            if (results.length > 0 && results[0]) {
-              const latestPath = join(testLogsDir, results[0].name);
-              const report = await xcrun('xccov', ['view', '--report', '--path', latestPath]);
-              return {
-                content: [{ type: 'text', text: JSON.stringify({ report: report.stdout }) }],
-              };
-            }
-          }
+        const latestPath = findLatestXcresult(config.projectPath);
+        if (latestPath) {
+          const report = await xcrun('xccov', ['view', '--report', '--path', latestPath]);
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ report: report.stdout }) }],
+          };
         }
 
         return {
@@ -353,8 +347,8 @@ export function registerTestingTools(server: XcodeMCPServer): void {
       required: ['test_identifier'],
     },
     handler: async (args) => {
-      const scheme = (args.scheme as string) || config.defaultScheme;
-      if (!scheme) {
+      const rawScheme = (args.scheme as string) || config.defaultScheme;
+      if (!rawScheme) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             code: 'NO_SCHEME',
@@ -364,13 +358,16 @@ export function registerTestingTools(server: XcodeMCPServer): void {
           isError: true,
         };
       }
+      const scheme = requireSchemeName(rawScheme);
+      const testIdentifier = requireNonEmptyString(args.test_identifier, 'test_identifier', 512);
 
+      const [projFlag, projPath] = projectFlag(config.projectPath);
       const buildArgs = [
+        projFlag, projPath,
         '-scheme', scheme,
-        '-project', config.projectPath,
         '-destination', (args.destination as string) || 'platform=iOS Simulator,name=iPhone 16',
         'test',
-        '-only-testing', args.test_identifier as string,
+        '-only-testing', testIdentifier,
       ];
 
       try {

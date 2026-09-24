@@ -1,17 +1,12 @@
 import { existsSync } from 'node:fs';
 import { readFile, writeFile, stat } from 'node:fs/promises';
-import { resolve as resolvePath } from 'node:path';
 import type { XcodeMCPServer } from '../server.js';
 import { logger } from '../lib/logger.js';
-import { pathTraversalDetected, fileNotFound } from '../lib/error_handler.js';
+import { fileNotFound, invalidInput } from '../lib/error_handler.js';
+import { assertPathInProject, requireNonEmptyString } from '../lib/validation.js';
 
-function assertPathInProject(projectDir: string, filePath: string): string {
-  const resolved = resolvePath(projectDir, filePath);
-  if (!resolved.startsWith(projectDir)) {
-    throw pathTraversalDetected(filePath);
-  }
-  return resolved;
-}
+const MAX_READ_BYTES = 1024 * 1024; // 1 MiB — use search/symbols for bigger files
+const MAX_WRITE_BYTES = 10 * 1024 * 1024; // 10 MiB
 
 export function registerCodeTools(server: XcodeMCPServer): void {
   const config = server.config;
@@ -30,7 +25,7 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['file_path'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
       if (!existsSync(resolvedPath)) {
@@ -40,8 +35,29 @@ export function registerCodeTools(server: XcodeMCPServer): void {
         };
       }
 
-      const content = await readFile(resolvedPath, 'utf-8');
       const fileStat = await stat(resolvedPath);
+      if (fileStat.size > MAX_READ_BYTES) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            code: 'FILE_TOO_LARGE',
+            message: `File is ${(fileStat.size / 1024 / 1024).toFixed(1)} MiB; limit is 1 MiB.`,
+            suggestion: 'Use xcode_search_in_project or xcode_get_swift_symbols to inspect large files.',
+          }) }],
+          isError: true,
+        };
+      }
+
+      const content = await readFile(resolvedPath, 'utf-8');
+      if (content.includes('\0')) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            code: 'BINARY_FILE',
+            message: 'File appears to be binary.',
+            suggestion: 'xcode_read_file only supports text files.',
+          }) }],
+          isError: true,
+        };
+      }
       const lines = content.split('\n');
 
       return {
@@ -79,8 +95,17 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['file_path', 'content'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
-      const content = args.content as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
+      if (typeof args.content !== 'string') {
+        throw invalidInput('content', 'Must be a string.');
+      }
+      if (args.content.length > MAX_WRITE_BYTES) {
+        throw invalidInput('content', 'Exceeds the 10 MiB write limit.');
+      }
+      const content = args.content;
+      if (args.create_if_missing !== undefined && typeof args.create_if_missing !== 'boolean') {
+        throw invalidInput('create_if_missing', 'Must be a boolean.');
+      }
       const createIfMissing = (args.create_if_missing as boolean) !== false;
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
@@ -146,9 +171,18 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['file_path', 'old_content', 'new_content'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
-      const oldContent = args.old_content as string;
-      const newContent = args.new_content as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
+      if (typeof args.old_content !== 'string' || args.old_content.length === 0) {
+        throw invalidInput('old_content', 'Must be a non-empty string.');
+      }
+      if (typeof args.new_content !== 'string') {
+        throw invalidInput('new_content', 'Must be a string (may be empty to delete).');
+      }
+      if (args.old_content.length > MAX_WRITE_BYTES || args.new_content.length > MAX_WRITE_BYTES) {
+        throw invalidInput('content', 'Exceeds the 10 MiB limit.');
+      }
+      const oldContent = args.old_content;
+      const newContent = args.new_content;
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
       if (!existsSync(resolvedPath)) {
@@ -209,12 +243,24 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['file_path'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
       if (!existsSync(resolvedPath)) {
         return {
           content: [{ type: 'text', text: JSON.stringify(fileNotFound(filePath)) }],
+          isError: true,
+        };
+      }
+
+      const fileStat = await stat(resolvedPath);
+      if (fileStat.size > MAX_READ_BYTES) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            code: 'FILE_TOO_LARGE',
+            message: 'File exceeds the 1 MiB symbol-extraction limit.',
+            suggestion: 'Split the file or search it with xcode_search_in_project.',
+          }) }],
           isError: true,
         };
       }
@@ -288,7 +334,7 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['file_path'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
       try {
@@ -359,8 +405,14 @@ export function registerCodeTools(server: XcodeMCPServer): void {
       required: ['query'],
     },
     handler: async (args) => {
-      const query = args.query as string;
-      const fileType = args.file_type as string | undefined;
+      const query = requireNonEmptyString(args.query, 'query', 1024);
+      const fileType = args.file_type === undefined ? undefined : requireNonEmptyString(args.file_type, 'file_type', 32);
+      if (args.case_sensitive !== undefined && typeof args.case_sensitive !== 'boolean') {
+        throw invalidInput('case_sensitive', 'Must be a boolean.');
+      }
+      if (args.regex !== undefined && typeof args.regex !== 'boolean') {
+        throw invalidInput('regex', 'Must be a boolean.');
+      }
       const caseSensitive = (args.case_sensitive as boolean) || false;
       const useRegex = (args.regex as boolean) || false;
 
@@ -392,7 +444,9 @@ export function registerCodeTools(server: XcodeMCPServer): void {
         grepArgs.push('--include', '*.swift', '--include', '*.m', '--include', '*.mm', '--include', '*.h');
       }
 
-      grepArgs.push(query, config.projectDir);
+      // '--' stops option parsing so a query starting with '-' (or one that
+      // looks like a grep flag) can never be interpreted as an option.
+      grepArgs.push('--', query, config.projectDir);
 
       try {
         const result = await execFileAsync('grep', grepArgs, { timeout: 30000 });

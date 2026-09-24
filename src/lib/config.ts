@@ -1,7 +1,8 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { readFile, access } from 'node:fs/promises';
 import { resolve as resolvePath, join } from 'node:path';
 import { logger } from './logger.js';
+import { parseTimeoutEnv } from './validation.js';
 
 export interface XcodeMCPConfig {
   projectPath: string;
@@ -23,8 +24,24 @@ export interface ProjectConfig {
 }
 
 function validateProjectPath(rawPath: string): string {
-  const resolved = resolvePath(rawPath);
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    throw new Error('XCODE_PROJECT_PATH is empty.\nSet it to the path of your .xcodeproj or .xcworkspace.');
+  }
+  const resolved = resolvePath(trimmed);
   if (!existsSync(resolved)) {
+    // If the user pointed at a directory containing a .xcodeproj/.xcworkspace, resolve it.
+    try {
+      const stat = readdirSync(resolved);
+      const candidate = stat.find((f) => f.endsWith('.xcworkspace') || f.endsWith('.xcodeproj'));
+      if (candidate) {
+        const full = join(resolved, candidate);
+        logger.info(`Resolved project directory to ${full}`);
+        return full;
+      }
+    } catch {
+      // Not a readable directory — fall through to the not-found error.
+    }
     throw new Error(
       `XCODE_PROJECT_PATH not found at: ${resolved}\n` +
       `Set the correct path in your environment or .env file.\n` +
@@ -50,7 +67,17 @@ async function loadProjectConfig(projectDir: string): Promise<ProjectConfig> {
   try {
     await access(configPath);
     const content = await readFile(configPath, 'utf-8');
-    return JSON.parse(content) as ProjectConfig;
+    try {
+      const parsed = JSON.parse(content) as ProjectConfig;
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        logger.warn(`Ignoring ${configPath}: expected a JSON object.`);
+        return {};
+      }
+      return parsed;
+    } catch (parseError) {
+      logger.warn(`Ignoring ${configPath}: invalid JSON (${parseError instanceof Error ? parseError.message : String(parseError)}).`);
+      return {};
+    }
   } catch {
     return {};
   }
@@ -86,21 +113,29 @@ export async function loadConfig(): Promise<ResolvedConfig> {
   const projectConfig = await loadProjectConfig(projectDir);
 
   const defaultScheme =
-    process.env.XCODE_DEFAULT_SCHEME ||
-    projectConfig.default_scheme;
+    process.env.XCODE_DEFAULT_SCHEME?.trim() ||
+    projectConfig.default_scheme?.trim();
 
   if (!defaultScheme) {
     logger.warn('No default scheme configured. Set XCODE_DEFAULT_SCHEME or add default_scheme to .xcode-mcp.json');
+  }
+
+  const derivedDataPath = process.env.XCODE_DERIVED_DATA_PATH?.trim() || undefined;
+
+  // Validate optional simulator identifier (UDID or name) — warn but don't fail.
+  const defaultSimulator = process.env.XCODE_DEFAULT_SIMULATOR?.trim() || projectConfig.default_simulator?.trim();
+  if (defaultSimulator && defaultSimulator.length > 256) {
+    logger.warn('Ignoring XCODE_DEFAULT_SIMULATOR: value exceeds 256 characters.');
   }
 
   return {
     projectPath,
     projectDir,
     defaultScheme: defaultScheme || '',
-    defaultSimulator: process.env.XCODE_DEFAULT_SIMULATOR || projectConfig.default_simulator,
-    derivedDataPath: process.env.XCODE_DERIVED_DATA_PATH,
-    buildTimeout: parseInt(process.env.XCODE_MCP_BUILD_TIMEOUT || '300', 10),
-    testTimeout: parseInt(process.env.XCODE_MCP_TEST_TIMEOUT || '600', 10),
+    defaultSimulator: defaultSimulator && defaultSimulator.length <= 256 ? defaultSimulator : undefined,
+    derivedDataPath,
+    buildTimeout: parseTimeoutEnv(process.env.XCODE_MCP_BUILD_TIMEOUT, 300),
+    testTimeout: parseTimeoutEnv(process.env.XCODE_MCP_TEST_TIMEOUT, 600),
     projectConfig,
   };
 }

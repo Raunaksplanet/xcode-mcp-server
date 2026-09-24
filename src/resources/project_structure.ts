@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync, lstatSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { XcodeMCPServer } from '../server.js';
 import { getProjectInfo } from '../lib/pbxproj_parser.js';
@@ -12,22 +12,47 @@ interface TreeNode {
   size?: number;
 }
 
-function buildFileTree(dirPath: string, projectDir: string, excludedPaths: string[] = []): TreeNode[] {
+const MAX_TREE_DEPTH = 25;
+const MAX_TREE_ENTRIES = 50000;
+
+function buildFileTree(
+  dirPath: string,
+  projectDir: string,
+  excludedPaths: string[] = [],
+  depth = 0,
+  seen: Set<string> = new Set(),
+  budget: { remaining: number } = { remaining: MAX_TREE_ENTRIES },
+): TreeNode[] {
   const entries: TreeNode[] = [];
+  if (depth > MAX_TREE_DEPTH || budget.remaining <= 0) return entries;
+
+  // Resolve the real path first: symlink loops and escaped links are cut here.
+  let realDir: string;
+  try {
+    realDir = realpathSync(dirPath);
+  } catch {
+    return entries;
+  }
+  if (seen.has(realDir)) return entries;
+  seen.add(realDir);
 
   try {
     const items = readdirSync(dirPath);
     for (const item of items) {
+      if (budget.remaining <= 0) break;
       const fullPath = join(dirPath, item);
       const relPath = relative(projectDir, fullPath);
 
+      if (relPath.startsWith('..')) continue; // link points outside the project
       if (excludedPaths.some(p => relPath.startsWith(p))) continue;
       if (item.startsWith('.') || item === 'DerivedData' || item === 'build') continue;
 
       try {
-        const stat = statSync(fullPath);
+        const stat = lstatSync(fullPath);
+        if (stat.isSymbolicLink()) continue; // never follow symlinks
         if (stat.isDirectory()) {
-          const children = buildFileTree(fullPath, projectDir, excludedPaths);
+          const children = buildFileTree(fullPath, projectDir, excludedPaths, depth + 1, seen, budget);
+          budget.remaining -= 1;
           entries.push({
             name: item,
             type: 'directory',
@@ -61,6 +86,7 @@ function buildFileTree(dirPath: string, projectDir: string, excludedPaths: strin
             file_type: typeMap[ext] || 'other',
             size: stat.size,
           });
+          budget.remaining -= 1;
         }
       } catch {
         continue;

@@ -5,6 +5,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { XcodeMCPServer } from '../server.js';
 import { setBuildSetting } from '../lib/pbxproj_writer.js';
+import { requireTargetName, requireNonEmptyString, optionalString } from '../lib/validation.js';
+import { invalidInput } from '../lib/error_handler.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -57,7 +59,17 @@ export function registerSigningTools(server: XcodeMCPServer): void {
     handler: async () => {
       try {
         const profilesDir = join(homedir(), 'Library', 'MobileDevice', 'Provisioning Profiles');
-        const files = readdirSync(profilesDir).filter(f => f.endsWith('.mobileprovision'));
+        let files: string[];
+        try {
+          files = readdirSync(profilesDir).filter(f => f.endsWith('.mobileprovision'));
+        } catch {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({
+              profiles: [],
+              message: 'No provisioning profiles directory found. Install profiles via Xcode first.',
+            }, null, 2) }],
+          };
+        }
 
         const profiles = [];
         for (const file of files) {
@@ -68,7 +80,12 @@ export function registerSigningTools(server: XcodeMCPServer): void {
           const bundleIdMatch = content.match(/<key>application-identifier<\/key>\s*<string>(.+?)<\/string>/);
           const teamMatch = content.match(/<key>com\.apple\.developer\.team-identifier<\/key>\s*<string>(.+?)<\/string>/);
           const expiryMatch = content.match(/<key>ExpirationDate<\/key>\s*<date>(.+?)<\/date>/);
-          const devCountMatch = content.match(/<key>ProvisionedDevices<\/key>\s*<array>\s*<string>(.+?)<\/string>/s);
+          // Count devices safely: split only when the section exists.
+          let deviceCount = 0;
+          const deviceSection = content.split('ProvisionedDevices')[1];
+          if (deviceSection) {
+            deviceCount = Math.max(0, deviceSection.split('<string>').length - 1);
+          }
 
           profiles.push({
             file,
@@ -76,7 +93,7 @@ export function registerSigningTools(server: XcodeMCPServer): void {
             bundle_id: bundleIdMatch?.[1] ? bundleIdMatch[1].replace(/^[A-Z0-9]+\./, '') : 'Unknown',
             team_id: teamMatch?.[1] || 'Unknown',
             expiry: expiryMatch?.[1] || 'Unknown',
-            device_count: devCountMatch ? content.split('ProvisionedDevices')[1]?.split('<string>').length! - 1 : 0,
+            device_count: deviceCount,
           });
         }
 
@@ -111,10 +128,20 @@ export function registerSigningTools(server: XcodeMCPServer): void {
       required: ['target', 'team_id', 'bundle_id'],
     },
     handler: async (args) => {
-      const target = args.target as string;
-      const teamId = args.team_id as string;
-      const bundleId = args.bundle_id as string;
+      const target = requireTargetName(args.target);
+      const teamId = requireNonEmptyString(args.team_id, 'team_id', 64);
+      if (!/^[A-Z0-9]{10}$/.test(teamId)) {
+        throw invalidInput('team_id', 'Must be a 10-character Apple Team ID (e.g. A1B2C3D4E5).');
+      }
+      const bundleId = requireNonEmptyString(args.bundle_id, 'bundle_id', 256);
+      if (!/^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z][A-Za-z0-9]*)+$/.test(bundleId)) {
+        throw invalidInput('bundle_id', 'Must be a reverse-DNS bundle identifier (e.g. com.example.App).');
+      }
+      if (args.automatic !== undefined && typeof args.automatic !== 'boolean') {
+        throw invalidInput('automatic', 'Must be a boolean.');
+      }
       const automatic = (args.automatic as boolean) !== false;
+      const profileName = optionalString(args.profile_name, 'profile_name', 256);
 
       try {
         for (const cfg of ['Debug', 'Release']) {
@@ -126,8 +153,8 @@ export function registerSigningTools(server: XcodeMCPServer): void {
             setBuildSetting(projectPath, target, cfg, 'CODE_SIGN_STYLE', 'Automatic');
           } else {
             setBuildSetting(projectPath, target, cfg, 'CODE_SIGN_STYLE', 'Manual');
-            if (args.profile_name) {
-              setBuildSetting(projectPath, target, cfg, 'PROVISIONING_PROFILE_SPECIFIER', args.profile_name as string);
+            if (profileName) {
+              setBuildSetting(projectPath, target, cfg, 'PROVISIONING_PROFILE_SPECIFIER', profileName);
             }
           }
         }
@@ -165,7 +192,10 @@ export function registerSigningTools(server: XcodeMCPServer): void {
       required: ['app_path'],
     },
     handler: async (args) => {
-      const appPath = args.app_path as string;
+      const appPath = requireNonEmptyString(args.app_path, 'app_path', 1024);
+      if (!appPath.endsWith('.app')) {
+        throw invalidInput('app_path', 'Must point to a .app bundle.');
+      }
 
       try {
         const result = await execFileAsync('codesign', ['--verify', '--verbose', appPath]);

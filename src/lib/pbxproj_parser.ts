@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { logger } from './logger.js';
 import type {
@@ -17,6 +17,40 @@ import type {
   FileEntry,
 } from '../types/pbxproj.js';
 
+/** Split a comma list, ignoring commas inside double-quoted strings. */
+function splitTopLevel(value: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let inStr = false;
+  let esc = false;
+  for (const ch of value) {
+    if (inStr) {
+      current += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+      current += ch;
+    } else if (ch === ',') {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  parts.push(current);
+  return parts;
+}
+
+function unquote(item: string): string {
+  item = item.trim();
+  if (item.startsWith('"') && item.endsWith('"') && item.length >= 2) {
+    return item.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  return item;
+}
+
 function parsePBXValue(value: string): string | string[] | boolean | number {
   value = value.trim();
 
@@ -24,8 +58,13 @@ function parsePBXValue(value: string): string | string[] | boolean | number {
     return value === 'YES';
   }
 
+  // Integers only up to 15 digits: longer all-digit tokens are object
+  // references (24-char IDs), and parseInt would silently corrupt them
+  // (e.g. 5555... → 5.555e+23). They must stay strings.
   if (/^-?\d+$/.test(value)) {
-    return parseInt(value, 10);
+    const digits = value.startsWith('-') ? value.length - 1 : value.length;
+    if (digits <= 15) return parseInt(value, 10);
+    return value;
   }
 
   if (/^-?\d+\.\d+$/.test(value)) {
@@ -35,20 +74,129 @@ function parsePBXValue(value: string): string | string[] | boolean | number {
   if (value.startsWith('(') && value.endsWith(')')) {
     const inner = value.slice(1, -1).trim();
     if (!inner) return [];
-    return inner.split(',').map(item => {
-      item = item.trim();
-      if ((item.startsWith('"') && item.endsWith('"'))) {
-        return item.slice(1, -1);
-      }
-      return item;
-    });
+    return splitTopLevel(inner).map(unquote).filter((s) => s.length > 0);
   }
 
   if (value.startsWith('"') && value.endsWith('"')) {
-    return value.slice(1, -1);
+    return unquote(value);
   }
 
   return value;
+}
+
+/**
+ * Remove /* ... *\/ comments that appear outside double-quoted strings.
+ * Real pbxproj files annotate nearly every entry (object IDs, file refs,
+ * array items), so the tokenizer must not see them. Comment markers inside
+ * quoted strings (e.g. shell scripts) are preserved.
+ */
+export function stripPbxComments(raw: string): string {
+  let out = '';
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i]!;
+    const next = raw[i + 1];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      const end = raw.indexOf('*/', i + 2);
+      i = end === -1 ? raw.length : end + 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Skip whitespace and both comment styles. Returns the next content index. */
+function skipTrivia(content: string, i: number): number {
+  for (;;) {
+    if (i >= content.length) return i;
+    const ch = content[i];
+    if (ch === '/' && content[i + 1] === '*') {
+      const end = content.indexOf('*/', i + 2);
+      i = end === -1 ? content.length : end + 2;
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '/') {
+      const end = content.indexOf('\n', i);
+      i = end === -1 ? content.length : end + 1;
+      continue;
+    }
+    if (ch !== undefined && /\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    return i;
+  }
+}
+
+/**
+ * Scan a value span starting at i (past `key =`): a quoted string (escapes
+ * honoured, so embedded ';' don't terminate it), a balanced (...) array, or
+ * a bare token up to the next ';'. Returns the raw span and the index just
+ * past the value (before the trailing ';').
+ */
+function scanValueSpan(content: string, i: number): { raw: string; endIdx: number } {
+  const first = content[i];
+  if (first === '"') {
+    let j = i + 1;
+    while (j < content.length) {
+      const ch = content[j]!;
+      if (ch === '\\' && j + 1 < content.length) {
+        j += 2;
+        continue;
+      }
+      if (ch === '"') {
+        return { raw: content.slice(i, j + 1), endIdx: j + 1 };
+      }
+      j++;
+    }
+    return { raw: content.slice(i), endIdx: content.length };
+  }
+  if (first === '(') {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+    while (j < content.length) {
+      const ch = content[j]!;
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          return { raw: content.slice(i, j + 1), endIdx: j + 1 };
+        }
+      }
+      j++;
+    }
+    return { raw: content.slice(i), endIdx: content.length };
+  }
+  const semi = content.indexOf(';', i);
+  if (semi === -1) return { raw: content.slice(i), endIdx: content.length };
+  return { raw: content.slice(i, semi), endIdx: semi };
 }
 
 function parsePBXObjectBlock(content: string, startIdx: number): { obj: Record<string, unknown>; endIdx: number } {
@@ -56,26 +204,8 @@ function parsePBXObjectBlock(content: string, startIdx: number): { obj: Record<s
   let i = startIdx;
 
   while (i < content.length) {
-    if (content[i] === '}') {
-      return { obj, endIdx: i + 1 };
-    }
-
-    if (content[i] === '/' && content[i + 1] === '*') {
-      const endComment = content.indexOf('*/', i + 2);
-      i = endComment !== -1 ? endComment + 2 : i + 2;
-      continue;
-    }
-
-    if (content[i] === '/' && content[i + 1] === '/') {
-      const endLine = content.indexOf('\n', i);
-      i = endLine !== -1 ? endLine + 1 : content.length;
-      continue;
-    }
-
-    if (/\s/.test(content[i]!)) {
-      i++;
-      continue;
-    }
+    i = skipTrivia(content, i);
+    if (i >= content.length) break;
 
     if (content[i] === '}') {
       return { obj, endIdx: i + 1 };
@@ -90,31 +220,24 @@ function parsePBXObjectBlock(content: string, startIdx: number): { obj: Record<s
     if (keyMatch) {
       const key = keyMatch[1]!;
       i += keyMatch[0].length;
+      i = skipTrivia(content, i);
 
       if (content[i] === '{') {
         const nested = parsePBXObjectBlock(content, i + 1);
-        obj[key] = parsePBXValue(String(nested.obj)) || nested.obj;
+        // Nested blocks are objects — never stringify them (String(obj) would
+        // produce "[object Object]" and permanently destroy the data on write).
+        obj[key] = nested.obj;
         i = nested.endIdx;
+        i = skipTrivia(content, i);
         if (content[i] === ';') i++;
         continue;
       }
 
-      const valueMatch = content.slice(i).match(/^([^;{}]+?)\s*;/);
-      if (valueMatch) {
-        const raw = valueMatch[1]!.trim();
-        obj[key] = parsePBXValue(raw);
-        i += valueMatch[0].length;
-        continue;
-      }
-
-      const semiIdx = content.indexOf(';', i);
-      if (semiIdx !== -1) {
-        const raw = content.slice(i, semiIdx).trim();
-        obj[key] = parsePBXValue(raw);
-        i = semiIdx + 1;
-      } else {
-        i++;
-      }
+      const { raw, endIdx } = scanValueSpan(content, i);
+      obj[key] = parsePBXValue(raw);
+      i = skipTrivia(content, endIdx);
+      if (content[i] === ';') i++;
+      else i = endIdx + 1;
       continue;
     }
 
@@ -126,7 +249,7 @@ function parsePBXObjectBlock(content: string, startIdx: number): { obj: Record<s
 
 export function parsePBXProject(filePath: string): ParsedPBXProject {
   logger.debug(`Parsing pbxproj: ${filePath}`);
-  const raw = readFileSync(filePath, 'utf-8');
+  const raw = stripPbxComments(readFileSync(filePath, 'utf-8'));
 
   const objectsMatch = raw.match(/objects\s*=\s*\{/);
   if (!objectsMatch) {
@@ -170,10 +293,39 @@ function resolveBuildSetting(buildConfigs: XCBuildConfiguration[], key: string):
   return undefined;
 }
 
+/** Resolve a .xcodeproj/.xcworkspace path to its project.pbxproj file. */
+export function resolvePbxprojPath(projectPath: string): string {
+  if (projectPath.endsWith('.xcodeproj')) {
+    return resolve(`${projectPath}/project.pbxproj`);
+  }
+  if (projectPath.endsWith('.xcworkspace')) {
+    // A workspace has no pbxproj of its own: use the sibling (or nested)
+    // .xcodeproj with the same base name, else the first one found.
+    const base = projectPath.replace(/\.xcworkspace$/, '');
+    const sameName = `${base}.xcodeproj/project.pbxproj`;
+    if (existsSync(sameName)) return resolve(sameName);
+    const dir = resolve(projectPath, '..');
+    try {
+      const entries = readdirSync(dir);
+      for (const entry of entries) {
+        if (entry.endsWith('.xcodeproj') && existsSync(resolve(dir, entry, 'project.pbxproj'))) {
+          return resolve(dir, entry, 'project.pbxproj');
+        }
+      }
+      // Last resort: workspace-internal project reference (rare).
+      for (const entry of entries) {
+        if (entry.endsWith('.xcodeproj')) return resolve(dir, entry, 'project.pbxproj');
+      }
+    } catch {
+      // Fall through to the error below.
+    }
+    throw new Error(`No .xcodeproj found next to workspace: ${projectPath}`);
+  }
+  return resolve(projectPath);
+}
+
 export function getProjectInfo(projectPath: string): ProjectInfo {
-  const pbxprojPath = resolve(projectPath.endsWith('.xcodeproj')
-    ? `${projectPath}/project.pbxproj`
-    : projectPath);
+  const pbxprojPath = resolvePbxprojPath(projectPath);
 
   const parsed = parsePBXProject(pbxprojPath);
   const { objects } = parsed;
@@ -256,13 +408,12 @@ function getSchemes(projectPath: string): SchemeInfo[] {
     : projectPath;
 
   const sharedSchemesDir = resolve(projectDir, 'xcshareddata', 'xcschemes');
-  const userSchemesDir = resolve(projectDir, 'xcuserdata');
+  const xcuserdataDir = resolve(projectDir, 'xcuserdata');
 
-      const { existsSync: _existsSync, readdirSync } = require('node:fs');
   const schemes: SchemeInfo[] = [];
 
   try {
-    if (_existsSync(sharedSchemesDir)) {
+    if (existsSync(sharedSchemesDir)) {
       const files = readdirSync(sharedSchemesDir).filter((f: string) => f.endsWith('.xcscheme'));
       for (const file of files) {
         const name = file.replace(/\.xcscheme$/, '');
@@ -281,12 +432,13 @@ function getSchemes(projectPath: string): SchemeInfo[] {
     logger.warn('Could not read shared schemes:', err);
   }
 
+  // User schemes live at xcuserdata/<user>.xcuserdatad/xcschemes/<name>.xcscheme
   try {
-    if (_existsSync(userSchemesDir)) {
-      const userDirs = readdirSync(userSchemesDir).filter((d: string) => d.startsWith('xcschememanagement'));
+    if (existsSync(xcuserdataDir)) {
+      const userDirs = readdirSync(xcuserdataDir).filter((d: string) => d.endsWith('.xcuserdatad'));
       for (const dir of userDirs) {
-        const userSchemeDir = resolve(userSchemesDir, dir, 'xcschemes');
-        if (_existsSync(userSchemeDir)) {
+        const userSchemeDir = resolve(xcuserdataDir, dir, 'xcschemes');
+        if (existsSync(userSchemeDir)) {
           const files = readdirSync(userSchemeDir).filter((f: string) => f.endsWith('.xcscheme'));
           for (const file of files) {
             const name = file.replace(/\.xcscheme$/, '');
@@ -310,9 +462,7 @@ function getSchemes(projectPath: string): SchemeInfo[] {
 }
 
 export function getFileEntries(projectPath: string, targetName?: string): FileEntry[] {
-  const pbxprojPath = resolve(projectPath.endsWith('.xcodeproj')
-    ? `${projectPath}/project.pbxproj`
-    : projectPath);
+  const pbxprojPath = resolvePbxprojPath(projectPath);
 
   const parsed = parsePBXProject(pbxprojPath);
   const { objects } = parsed;
@@ -320,7 +470,8 @@ export function getFileEntries(projectPath: string, targetName?: string): FileEn
   if (!projectObj) return [];
 
   const entries: FileEntry[] = [];
-  const targetFileRefs = new Set<string>();
+  // fileRefId -> set of target names that include it
+  const membership = new Map<string, Set<string>>();
 
   for (const targetId of projectObj.targets || []) {
     const target = getObject<PBXNativeTarget>(objects, targetId);
@@ -330,42 +481,51 @@ export function getFileEntries(projectPath: string, targetName?: string): FileEn
       const phase = objects[phaseId];
       if (!phase) continue;
 
-      let fileRefs: string[] = [];
+      // Snapshot the phase file list: never mutate the array being iterated.
+      let buildFileIds: string[] = [];
       if (phase.isa === 'PBXSourcesBuildPhase' || phase.isa === 'PBXResourcesBuildPhase') {
         const phaseObj = phase as PBXSourcesBuildPhase | PBXResourcesBuildPhase;
-        fileRefs = phaseObj.files || [];
+        buildFileIds = [...(phaseObj.files || [])];
       }
 
-      for (const fileId of fileRefs) {
+      for (const fileId of buildFileIds) {
         const buildFile = getObject<PBXBuildFile>(objects, fileId);
         if (buildFile?.fileRef) {
-          fileRefs.push(buildFile.fileRef);
+          let owners = membership.get(buildFile.fileRef);
+          if (!owners) {
+            owners = new Set<string>();
+            membership.set(buildFile.fileRef, owners);
+          }
+          owners.add(target.name);
         }
       }
     }
   }
 
-  if (targetFileRefs.size === 0) {
+  const typeMap: Record<string, FileEntry['type']> = {
+    swift: 'swift',
+    m: 'objc',
+    mm: 'objc',
+    h: 'objc',
+    cpp: 'objc',
+    c: 'objc',
+    storyboard: 'storyboard',
+    xib: 'xib',
+    xcassets: 'xcassets',
+    plist: 'plist',
+    strings: 'strings',
+    json: 'json',
+    entitlements: 'entitlements',
+  };
+
+  if (membership.size === 0) {
+    // No build-phase membership found (e.g. unknown target filter): fall back
+    // to listing every file reference with empty membership.
     for (const obj of Object.values(objects)) {
       if (obj?.isa === 'PBXFileReference' && (obj as PBXFileReference).path) {
         const ref = obj as PBXFileReference;
         const path = ref.path || ref.name || '';
         const ext = path.split('.').pop()?.toLowerCase() || '';
-        const typeMap: Record<string, FileEntry['type']> = {
-          swift: 'swift',
-          m: 'objc',
-          mm: 'objc',
-          h: 'objc',
-          cpp: 'objc',
-          c: 'objc',
-          storyboard: 'storyboard',
-          xib: 'xib',
-          xcassets: 'xcassets',
-          plist: 'plist',
-          strings: 'strings',
-          json: 'json',
-          entitlements: 'entitlements',
-        };
         entries.push({
           path,
           type: typeMap[ext] || 'other',
@@ -374,6 +534,20 @@ export function getFileEntries(projectPath: string, targetName?: string): FileEn
         });
       }
     }
+  } else {
+    for (const [fileRefId, owners] of membership) {
+      const ref = getObject<PBXFileReference>(objects, fileRefId);
+      if (!ref) continue;
+      const path = ref.path || ref.name || '';
+      const ext = path.split('.').pop()?.toLowerCase() || '';
+      entries.push({
+        path,
+        type: typeMap[ext] || 'other',
+        targetMembership: [...owners].sort(),
+        sourceTree: ref.sourceTree,
+      });
+    }
+    entries.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   return entries;

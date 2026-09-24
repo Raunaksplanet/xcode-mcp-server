@@ -377,13 +377,14 @@ Get all warnings from latest build.
 Profile with Instruments.
 
 **Inputs:**
-- `scheme` (string, optional)
-- `destination` (string, optional)
+- `scheme` (string, optional) — used for the trace filename and metadata
+- `destination` (string, optional) — Simulator UDID or name (defaults to the booted simulator)
 - `template` (string, optional, default: Time Profiler)
-- `duration_seconds` (number, optional, default: 10)
+- `duration_seconds` (number, optional, default: 10, max: 300)
 
 ### xcode_add_spm_package
-Add Swift Package Manager dependency.
+Add a Swift Package Manager dependency: inserts the package reference, links
+its product to the target, then resolves dependencies.
 
 **Inputs:**
 - `url` (string, required)

@@ -54,6 +54,7 @@ export interface PBXProject extends PBXObject {
   projectRoot: string;
   targets: string[];
   attributes: Record<string, unknown>;
+  packageReferences?: string[];
 }
 
 export interface XCBuildConfiguration extends PBXObject {
@@ -104,6 +105,18 @@ export interface PBXShellScriptBuildPhase extends PBXObject {
 }
 
 export type BuildPhase = PBXSourcesBuildPhase | PBXFrameworksBuildPhase | PBXResourcesBuildPhase | PBXShellScriptBuildPhase;
+
+export interface XCRemoteSwiftPackageReference extends PBXObject {
+  isa: 'XCRemoteSwiftPackageReference';
+  repositoryURL: string;
+  requirement: Record<string, string>;
+}
+
+export interface XCSwiftPackageProductDependency extends PBXObject {
+  isa: 'XCSwiftPackageProductDependency';
+  package?: string;
+  productName: string;
+}
 
 export interface TargetInfo {
   id: string;

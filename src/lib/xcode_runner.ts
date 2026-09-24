@@ -1,8 +1,9 @@
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createExec } from './process_manager.js';
+import { createExec, withBuildSlot } from './process_manager.js';
 import { logger } from './logger.js';
+import { projectFlag } from './validation.js';
 import type { BuildIssue, BuildResult, BuildSettings } from '../types/xcodebuild.js';
 
 interface XCRunOptions {
@@ -12,6 +13,7 @@ interface XCRunOptions {
 }
 
 interface XcodeBuildOptions {
+  projectPath?: string;
   scheme?: string;
   configuration?: string;
   destination?: string;
@@ -22,30 +24,22 @@ interface XcodeBuildOptions {
   xcargs?: string[];
 }
 
-function sanitizeArgs(args: string[]): string[] {
-  return args.map(a => {
-    if (a.includes('$') || a.includes('`') || a.includes(';') || a.includes('|')) {
-      return a.replace(/\$/g, '\\$').replace(/`/g, '\\`').replace(/;/g, '\\;').replace(/\|/g, '\\|');
-    }
-    return a;
-  });
-}
-
-export async function xcrun(command: string, args: string[], options: XCRunOptions = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const allArgs = sanitizeArgs([command, ...args]);
-  return createExec('xcrun', allArgs, {
+export async function xcrun(command: string, args: string[], options: XCRunOptions = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
+  // execFile bypasses any shell, so no escaping is needed (or valid): pass
+  // arguments through verbatim. Previous "sanitization" corrupted legitimate
+  // values containing $ or backticks.
+  return createExec('xcrun', [command, ...args], {
     timeout: options.timeout,
     onStdout: options.onStdout,
     onStderr: options.onStderr,
   });
 }
 
-export async function xcodebuild(args: string[], options: XcodeBuildOptions = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const allArgs = sanitizeArgs(args);
-  return createExec('xcodebuild', allArgs, {
+export async function xcodebuild(args: string[], options: XcodeBuildOptions = {}): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
+  return createExec('xcodebuild', args, {
     timeout: options.timeout,
-    onStdout: options.onProgress || options.onProgress,
-    onStderr: options.onProgress || options.onProgress,
+    onStdout: options.onProgress,
+    onStderr: options.onProgress,
   });
 }
 
@@ -55,24 +49,37 @@ export function parseBuildOutput(stdout: string, stderr: string): { errors: Buil
   const lines = (stdout + '\n' + stderr).split('\n');
 
   for (const line of lines) {
-    const errorMatch = line.match(/^(?:(.+?):(\d+):(?:\d+)?:\s*)?error:\s*(.+)$/);
+    const errorMatch = line.match(/^(?:(.+?):(\d+):(?:(\d+):)?\s*)?(?:fatal\s+)?error:\s*(.+)$/);
     if (errorMatch) {
       errors.push({
         type: 'error',
         file: errorMatch[1],
         line: errorMatch[2] ? parseInt(errorMatch[2], 10) : undefined,
-        message: errorMatch[3]?.trim() || '',
+        column: errorMatch[3] ? parseInt(errorMatch[3], 10) : undefined,
+        message: errorMatch[4]?.trim() || '',
       });
       continue;
     }
 
-    const warningMatch = line.match(/^(?:(.+?):(\d+):(?:\d+)?:\s*)?warning:\s*(.+)$/);
+    // Linker/driver failures without a file: prefix (e.g. "ld: library not
+    // found", "clang: error: ...") never matched the pattern above.
+    const toolErrorMatch = line.match(/^(ld|clang|swiftc|actool|ibtool|libtool|ditto|codesign):\s*(?:error:\s*)?(.+)$/);
+    if (toolErrorMatch) {
+      errors.push({
+        type: 'error',
+        message: line.trim(),
+      });
+      continue;
+    }
+
+    const warningMatch = line.match(/^(?:(.+?):(\d+):(?:(\d+):)?\s*)?warning:\s*(.+)$/);
     if (warningMatch) {
       warnings.push({
         type: 'warning',
         file: warningMatch[1],
         line: warningMatch[2] ? parseInt(warningMatch[2], 10) : undefined,
-        message: warningMatch[3]?.trim() || '',
+        column: warningMatch[3] ? parseInt(warningMatch[3], 10) : undefined,
+        message: warningMatch[4]?.trim() || '',
       });
       continue;
     }
@@ -85,13 +92,14 @@ export function parseBuildOutput(stdout: string, stderr: string): { errors: Buil
       continue;
     }
 
-    const noteMatch = line.match(/^(?:(.+?):(\d+):(?:\d+)?:\s*)?note:\s*(.+)$/);
+    const noteMatch = line.match(/^(?:(.+?):(\d+):(?:(\d+):)?\s*)?note:\s*(.+)$/);
     if (noteMatch) {
       errors.push({
         type: 'note',
         file: noteMatch[1],
         line: noteMatch[2] ? parseInt(noteMatch[2], 10) : undefined,
-        message: noteMatch[3]?.trim() || '',
+        column: noteMatch[3] ? parseInt(noteMatch[3], 10) : undefined,
+        message: noteMatch[4]?.trim() || '',
       });
     }
   }
@@ -111,16 +119,23 @@ export function getBuildTime(stdout: string): number {
   return 0;
 }
 
-export function buildSucceeded(stdout: string): boolean {
-  return stdout.includes('BUILD SUCCEEDED');
+export function buildSucceeded(stdout: string, stderr = ''): boolean {
+  return stdout.includes('BUILD SUCCEEDED') || stderr.includes('BUILD SUCCEEDED');
 }
 
-export function buildFailedCheck(stdout: string): boolean {
-  return stdout.includes('BUILD FAILED');
+export function buildFailedCheck(stdout: string, stderr = ''): boolean {
+  return stdout.includes('BUILD FAILED') || stderr.includes('BUILD FAILED');
 }
 
 export async function runBuild(options: XcodeBuildOptions): Promise<BuildResult> {
   const args: string[] = [];
+
+  // The project (or workspace) selector is mandatory: without it xcodebuild
+  // builds whatever happens to be in the process working directory.
+  if (options.projectPath) {
+    const [flag, path] = projectFlag(options.projectPath);
+    args.push(flag, path);
+  }
 
   if (options.clean) {
     args.push('clean');
@@ -151,13 +166,15 @@ export async function runBuild(options: XcodeBuildOptions): Promise<BuildResult>
   const startTime = Date.now();
   const progressLog: string[] = [];
 
-  const result = await xcodebuild(args, {
+  // Serialize heavy builds (max 2): concurrent xcodebuild processes fight
+  // over DerivedData and corrupt each other's outputs.
+  const result = await withBuildSlot(() => xcodebuild(args, {
     timeout: options.timeout,
     onProgress: (line: string) => {
       progressLog.push(line);
       if (options.onProgress) options.onProgress(line);
     },
-  });
+  }));
 
   const buildTime = (Date.now() - startTime) / 1000;
   const combinedOutput = result.stdout + '\n' + result.stderr;
@@ -165,7 +182,7 @@ export async function runBuild(options: XcodeBuildOptions): Promise<BuildResult>
 
   const parsed = parseBuildOutput(result.stdout, result.stderr);
 
-  const success = buildSucceeded(result.stdout);
+  const success = buildSucceeded(result.stdout, result.stderr);
 
   if (!success) {
     logger.error('Build failed:', result.stderr.slice(0, 500));
@@ -186,8 +203,9 @@ export async function runBuild(options: XcodeBuildOptions): Promise<BuildResult>
   };
 }
 
-export async function getBuildSettings(target: string, configuration: string): Promise<BuildSettings> {
-  const args = ['-showBuildSettings', '-target', target, '-configuration', configuration];
+export async function getBuildSettings(projectPath: string, target: string, configuration: string): Promise<BuildSettings> {
+  const [flag, path] = projectFlag(projectPath);
+  const args = [flag, path, '-showBuildSettings', '-target', target, '-configuration', configuration];
   const result = await xcodebuild(args);
   const settings: BuildSettings = {};
 
@@ -202,7 +220,8 @@ export async function getBuildSettings(target: string, configuration: string): P
 }
 
 export async function resolvePackageDependencies(projectPath: string): Promise<{ packages: string[]; output: string }> {
-  const args = ['-resolvePackageDependencies', '-project', projectPath];
+  const [flag, path] = projectFlag(projectPath);
+  const args = ['-resolvePackageDependencies', flag, path];
   const result = await xcodebuild(args);
   const packages: string[] = [];
   for (const line of result.stdout.split('\n')) {
@@ -221,9 +240,10 @@ export async function archiveBuild(
 ): Promise<{ archivePath?: string; exportPath?: string; success: boolean; errors: BuildIssue[]; warnings: BuildIssue[] }> {
   const tmpDir = await mkdtemp(join(tmpdir(), 'xcode-mcp-archive-'));
   const archivePath = join(tmpDir, `${scheme}.xcarchive`);
+  const [projFlag, projPath] = projectFlag(projectPath);
 
   const archiveArgs = [
-    '-project', projectPath,
+    projFlag, projPath,
     '-scheme', scheme,
     '-configuration', 'Release',
     '-archivePath', archivePath,
@@ -231,10 +251,10 @@ export async function archiveBuild(
   ];
 
   logger.info(`Archiving ${scheme} to ${archivePath}`);
-  const archiveResult = await xcodebuild(archiveArgs, { timeout: 600000 });
+  const archiveResult = await withBuildSlot(() => xcodebuild(archiveArgs, { timeout: 600000 }));
   const parsed = parseBuildOutput(archiveResult.stdout, archiveResult.stderr);
 
-  if (!buildSucceeded(archiveResult.stdout)) {
+  if (!buildSucceeded(archiveResult.stdout, archiveResult.stderr)) {
     return { success: false, errors: parsed.errors, warnings: parsed.warnings };
   }
 
@@ -255,10 +275,10 @@ export async function archiveBuild(
     '-exportPath', exportPath,
   ];
 
-  const exportResult = await xcodebuild(exportArgs, { timeout: 600000 });
+  const exportResult = await withBuildSlot(() => xcodebuild(exportArgs, { timeout: 600000 }));
   const exportParsed = parseBuildOutput(exportResult.stdout, exportResult.stderr);
 
-  if (!buildSucceeded(exportResult.stdout)) {
+  if (!buildSucceeded(exportResult.stdout, exportResult.stderr)) {
     return { success: false, archivePath, errors: exportParsed.errors, warnings: [...parsed.warnings, ...exportParsed.warnings] };
   }
 
@@ -274,6 +294,8 @@ function exportOptionsToPlist(options: Record<string, unknown>): string {
       plist += `  <key>${escapePlistString(key)}</key>\n  <string>${escapePlistString(value)}</string>\n`;
     } else if (typeof value === 'boolean') {
       plist += `  <key>${escapePlistString(key)}</key>\n  <${value}/>\n`;
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      plist += `  <key>${escapePlistString(key)}</key>\n  <integer>${Math.trunc(value)}</integer>\n`;
     } else if (Array.isArray(value)) {
       plist += `  <key>${escapePlistString(key)}</key>\n  <array>\n`;
       for (const item of value) {
@@ -290,10 +312,11 @@ function escapePlistString(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&apos;').replace(/"/g, '&quot;');
 }
 
-export async function runAnalyze(scheme: string, target?: string): Promise<{ issues: BuildIssue[]; output: string }> {
-  const args = ['analyze', '-scheme', scheme];
+export async function runAnalyze(projectPath: string, scheme: string, target?: string): Promise<{ issues: BuildIssue[]; output: string }> {
+  const [flag, path] = projectFlag(projectPath);
+  const args = [flag, path, 'analyze', '-scheme', scheme];
   if (target) args.push('-target', target);
-  const result = await xcodebuild(args, { timeout: 600000 });
+  const result = await withBuildSlot(() => xcodebuild(args, { timeout: 600000 }));
   const parsed = parseBuildOutput(result.stdout, result.stderr);
-  return { issues: [...parsed.errors, ...parsed.warnings], output: result.stdout + result.stderr };
+  return { issues: [...parsed.errors, ...parsed.warnings], output: (result.stdout + result.stderr).slice(-20000) };
 }

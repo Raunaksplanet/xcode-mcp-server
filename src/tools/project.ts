@@ -7,17 +7,17 @@ import { getProjectInfo, getFileEntries } from '../lib/pbxproj_parser.js';
 import { addFileToProject, removeFileFromProject, setBuildSetting } from '../lib/pbxproj_writer.js';
 import { getBuildSettings } from '../lib/xcode_runner.js';
 import { logger } from '../lib/logger.js';
-import { pathTraversalDetected, fileNotFound } from '../lib/error_handler.js';
+import { fileNotFound, invalidInput } from '../lib/error_handler.js';
+import {
+  assertPathInProject,
+  requireNonEmptyString,
+  requireTargetName,
+  requireConfigurationName,
+  requireBuildSettingKey,
+  optionalString,
+} from '../lib/validation.js';
 
 const execFileAsync = promisify(execFile);
-
-function assertPathInProject(projectDir: string, filePath: string): string {
-  const resolved = resolvePath(projectDir, filePath);
-  if (!resolved.startsWith(projectDir)) {
-    throw pathTraversalDetected(filePath);
-  }
-  return resolved;
-}
 
 export function registerProjectTools(server: XcodeMCPServer): void {
   const config = server.config;
@@ -35,7 +35,11 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const projectPath = (args.project_path as string) || config.projectPath;
+      const rawPath = optionalString(args.project_path, 'project_path');
+      if (rawPath && !rawPath.endsWith('.xcodeproj') && !rawPath.endsWith('.xcworkspace')) {
+        throw invalidInput('project_path', 'Must point to a .xcodeproj or .xcworkspace.');
+      }
+      const projectPath = rawPath || config.projectPath;
 
       if (!existsSync(projectPath)) {
         return {
@@ -86,7 +90,11 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const projectPath = (args.project_path as string) || config.projectPath;
+      const rawPath = optionalString(args.project_path, 'project_path');
+      if (rawPath && !rawPath.endsWith('.xcodeproj') && !rawPath.endsWith('.xcworkspace')) {
+        throw invalidInput('project_path', 'Must point to a .xcodeproj or .xcworkspace.');
+      }
+      const projectPath = rawPath || config.projectPath;
       const info = getProjectInfo(projectPath);
       return {
         content: [{ type: 'text', text: JSON.stringify(info, null, 2) }],
@@ -142,8 +150,12 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       },
     },
     handler: async (args) => {
-      const targetName = args.target as string | undefined;
-      const fileType = args.file_type as string | undefined;
+      const targetName = optionalString(args.target, 'target', 256);
+      const fileType = optionalString(args.file_type, 'file_type', 32);
+      const allowedTypes = ['swift', 'objc', 'storyboard', 'xcassets', 'plist', 'xib', 'strings', 'json', 'entitlements'];
+      if (fileType && !allowedTypes.includes(fileType)) {
+        throw invalidInput('file_type', `Must be one of: ${allowedTypes.join(', ')}.`);
+      }
       const entries = getFileEntries(config.projectPath, targetName);
 
       let filtered = entries;
@@ -170,9 +182,9 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       required: ['file_path', 'target'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
-      const targetName = args.target as string;
-      const content = args.content as string | undefined;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
+      const targetName = requireTargetName(args.target);
+      const content = optionalString(args.content, 'content', 10 * 1024 * 1024);
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
       if (!existsSync(resolvedPath) && content) {
@@ -219,8 +231,11 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       required: ['file_path', 'target'],
     },
     handler: async (args) => {
-      const filePath = args.file_path as string;
-      const targetName = args.target as string;
+      const filePath = requireNonEmptyString(args.file_path, 'file_path');
+      const targetName = requireTargetName(args.target);
+      if (args.delete_from_disk !== undefined && typeof args.delete_from_disk !== 'boolean') {
+        throw invalidInput('delete_from_disk', 'Must be a boolean.');
+      }
       const deleteFromDisk = (args.delete_from_disk as boolean) || false;
       const resolvedPath = assertPathInProject(config.projectDir, filePath);
 
@@ -261,11 +276,11 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       required: ['target'],
     },
     handler: async (args) => {
-      const target = args.target as string;
-      const configuration = (args.configuration as string) || 'Release';
+      const target = requireTargetName(args.target);
+      const configuration = requireConfigurationName(args.configuration ?? 'Release');
 
       try {
-        const settings = await getBuildSettings(target, configuration);
+        const settings = await getBuildSettings(config.projectPath, target, configuration);
         return {
           content: [{ type: 'text', text: JSON.stringify(settings, null, 2) }],
         };
@@ -296,10 +311,10 @@ export function registerProjectTools(server: XcodeMCPServer): void {
       required: ['target', 'configuration', 'key', 'value'],
     },
     handler: async (args) => {
-      const target = args.target as string;
-      const configuration = args.configuration as string;
-      const key = args.key as string;
-      const value = args.value as string;
+      const target = requireTargetName(args.target);
+      const configuration = requireConfigurationName(args.configuration);
+      const key = requireBuildSettingKey(args.key);
+      const value = requireNonEmptyString(args.value, 'value', 4096);
 
       try {
         setBuildSetting(config.projectPath, target, configuration, key, value);

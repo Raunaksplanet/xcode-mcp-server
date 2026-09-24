@@ -15,6 +15,19 @@ import {
   pushNotification,
   resetSimulator,
 } from '../lib/simulator_manager.js';
+import {
+  requireUdidOrName,
+  requireBundleId,
+  requireNonEmptyString,
+  requireUrl,
+  requireLatitude,
+  requireLongitude,
+  requirePayloadObject,
+  optionalString,
+  clampLines,
+  clampDurationSeconds,
+} from '../lib/validation.js';
+import { invalidInput } from '../lib/error_handler.js';
 export function registerSimulatorTools(server: XcodeMCPServer): void {
 
   server.registerTool({
@@ -43,7 +56,7 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid'],
     },
     handler: async (args) => {
-      const query = args.udid as string;
+      const query = requireUdidOrName(args.udid);
       let udid = query;
 
       if (query.length < 36) {
@@ -90,7 +103,7 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid'],
     },
     handler: async (args) => {
-      const udid = args.udid as string;
+      const udid = requireUdidOrName(args.udid);
       try {
         await shutdownSimulator(udid);
         return {
@@ -121,8 +134,10 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'app_path'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const appPath = requireNonEmptyString(args.app_path, 'app_path', 1024);
       try {
-        await installApp(args.udid as string, args.app_path as string);
+        await installApp(udid, appPath);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
         };
@@ -153,10 +168,25 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'bundle_id'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
+      if (args.arguments !== undefined) {
+        if (!Array.isArray(args.arguments) || args.arguments.some((a) => typeof a !== 'string')) {
+          throw invalidInput('arguments', 'Must be an array of strings.');
+        }
+      }
+      if (args.environment !== undefined) {
+        if (typeof args.environment !== 'object' || args.environment === null || Array.isArray(args.environment)) {
+          throw invalidInput('environment', 'Must be an object of string to string.');
+        }
+        for (const [k, v] of Object.entries(args.environment as Record<string, unknown>)) {
+          if (typeof v !== 'string') throw invalidInput('environment', `Value for "${k}" must be a string.`);
+        }
+      }
       try {
         const pid = await launchApp(
-          args.udid as string,
-          args.bundle_id as string,
+          udid,
+          bundleId,
           args.arguments as string[] | undefined,
           args.environment as Record<string, string> | undefined,
         );
@@ -188,8 +218,10 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'bundle_id'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
       try {
-        await terminateApp(args.udid as string, args.bundle_id as string);
+        await terminateApp(udid, bundleId);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
         };
@@ -220,11 +252,15 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = args.bundle_id === undefined ? undefined : requireBundleId(args.bundle_id);
+      const lines = clampLines(args.lines, 100);
+      const filter = optionalString(args.filter, 'filter', 1024);
       try {
-        const logs = await getSimulatorLogs(args.udid as string, {
-          bundleId: args.bundle_id as string | undefined,
-          lines: (args.lines as number) || 100,
-          filter: args.filter as string | undefined,
+        const logs = await getSimulatorLogs(udid, {
+          bundleId,
+          lines,
+          filter,
         });
         return {
           content: [{ type: 'text', text: JSON.stringify(logs, null, 2) }],
@@ -254,8 +290,10 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const outputPath = optionalString(args.output_path, 'output_path');
       try {
-        const path = await screenshotSimulator(args.udid as string, args.output_path as string | undefined);
+        const path = await screenshotSimulator(udid, outputPath);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true, path }) }],
         };
@@ -285,11 +323,14 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'output_path'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const outputPath = requireNonEmptyString(args.output_path, 'output_path');
+      const duration = clampDurationSeconds(args.duration_seconds, 10, 300);
       try {
         const path = await recordSimulator(
-          args.udid as string,
-          args.output_path as string,
-          (args.duration_seconds as number) || 10,
+          udid,
+          outputPath,
+          duration,
         );
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true, path }) }],
@@ -319,8 +360,10 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'url'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const url = requireUrl(args.url);
       try {
-        await openURL(args.udid as string, args.url as string);
+        await openURL(udid, url);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
         };
@@ -350,8 +393,11 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'latitude', 'longitude'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const latitude = requireLatitude(args.latitude);
+      const longitude = requireLongitude(args.longitude);
       try {
-        await setSimulatorLocation(args.udid as string, args.latitude as number, args.longitude as number);
+        await setSimulatorLocation(udid, latitude, longitude);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
         };
@@ -381,8 +427,11 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid', 'bundle_id', 'payload'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
+      const bundleId = requireBundleId(args.bundle_id);
+      const payload = requirePayloadObject(args.payload);
       try {
-        await pushNotification(args.udid as string, args.bundle_id as string, args.payload as Record<string, unknown>);
+        await pushNotification(udid, bundleId, payload);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
         };
@@ -410,10 +459,11 @@ export function registerSimulatorTools(server: XcodeMCPServer): void {
       required: ['udid'],
     },
     handler: async (args) => {
+      const udid = requireUdidOrName(args.udid);
       try {
-        await resetSimulator(args.udid as string);
+        await resetSimulator(udid);
         return {
-          content: [{ type: 'text', text: JSON.stringify({ success: true, udid: args.udid }) }],
+          content: [{ type: 'text', text: JSON.stringify({ success: true, udid }) }],
         };
       } catch (error) {
         return {

@@ -93,6 +93,20 @@ export class XcodeMCPServer {
       } catch (error) {
         logger.error(`Tool ${toolName} error:`, error);
         if (error instanceof McpError) throw error;
+        // Validation helpers throw plain MCPError-shaped objects
+        // ({ code, message, suggestion }); return them as-is instead of
+        // stringifying to "[object Object]".
+        if (
+          error !== null &&
+          typeof error === 'object' &&
+          'code' in (error as Record<string, unknown>) &&
+          typeof (error as Record<string, unknown>).code === 'string'
+        ) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify(error) }],
+            isError: true,
+          };
+        }
         const msg = error instanceof Error ? error.message : String(error);
         return {
           content: [{ type: 'text', text: JSON.stringify({
@@ -161,6 +175,10 @@ export class XcodeMCPServer {
     process.on('uncaughtException', (error) => {
       logger.error('Uncaught exception:', error);
       killAllChildProcesses();
+      // Never limp on in an unknown state: flush logs and exit non-zero so
+      // the client restarts us cleanly.
+      process.exitCode = 1;
+      setTimeout(() => process.exit(1), 100).unref?.();
     });
 
     process.on('unhandledRejection', (reason) => {
@@ -169,14 +187,23 @@ export class XcodeMCPServer {
   }
 
   registerTool(tool: ToolDefinition): void {
+    if (this.tools.has(tool.name)) {
+      throw new Error(`Duplicate tool registration: ${tool.name}`);
+    }
     this.tools.set(tool.name, tool);
   }
 
   registerResource(resource: ResourceDefinition): void {
+    if (this.resources.has(resource.uri)) {
+      throw new Error(`Duplicate resource registration: ${resource.uri}`);
+    }
     this.resources.set(resource.uri, resource);
   }
 
   registerPrompt(prompt: PromptDefinition): void {
+    if (this.prompts.has(prompt.name)) {
+      throw new Error(`Duplicate prompt registration: ${prompt.name}`);
+    }
     this.prompts.set(prompt.name, prompt);
   }
 
@@ -204,6 +231,9 @@ export class XcodeMCPServer {
   }
 
   async start(): Promise<void> {
+    if (!this.config) {
+      throw new Error('Server started without init(): call await server.init() first.');
+    }
     this.registerAllTools();
     logger.info(`Registered ${this.tools.size} tools, ${this.resources.size} resources, ${this.prompts.size} prompts`);
 
